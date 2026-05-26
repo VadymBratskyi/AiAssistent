@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite3
+*.db
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+.vscode/
+.idea/
+
+# whisper model files — downloaded locally / cached in PVC
+models/
+*.bin

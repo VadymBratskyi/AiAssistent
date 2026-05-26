@@ -1,0 +1,56 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: assistant-data
+  namespace: default
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 3Gi          # sqlite + whisper model cache (~1GB) + headroom
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: assistant
+  namespace: default
+  labels:
+    app: assistant
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate          # SQLite on RWO PVC: never run two pods at once
+  selector:
+    matchLabels:
+      app: assistant
+  template:
+    metadata:
+      labels:
+        app: assistant
+    spec:
+      containers:
+        - name: assistant
+          image: assistant:0.1.0
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - secretRef:
+                name: assistant-secrets
+          env:
+            - name: ASSISTANT_DB_PATH
+              value: /data/assistant.sqlite
+            - name: WHISPER_CACHE_DIR
+              value: /data/whisper
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 700Mi          # whisper `small` int8 ~ 500MB + bot ~150MB
+            limits:
+              cpu: 2000m
+              memory: 1500Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: assistant-data
