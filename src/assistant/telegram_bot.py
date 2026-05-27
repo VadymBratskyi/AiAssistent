@@ -4,7 +4,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, ReplyKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -20,6 +20,34 @@ from .config import Config
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
+
+# Known Atlassian cloud for this user (see project CLAUDE.md).
+JIRA_CLOUD_ID = "5989155e-2f13-4fe3-9126-df63c85122a8"
+
+# Persistent tappable keyboard shown under the message input.
+# Buttons send literal "/my" etc., which the CommandHandlers pick up.
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [["/my", "/free"], ["/reset"]],
+    resize_keyboard=True,
+    is_persistent=True,
+    input_field_placeholder="Команда або повідомлення…",
+)
+
+# Canned instructions for the shortcut commands. Phrased as natural requests
+# so they sit cleanly in the conversation history and the agent (which has the
+# Atlassian MCP) executes them with the exact JQL — no guessing.
+PROMPT_MY = (
+    "Покажи мої задачі в роботі. Використай Atlassian Jira MCP з "
+    f'cloudId {JIRA_CLOUD_ID} і JQL: assignee = currentUser() AND status = "In Progress". '
+    "Виведи стисло для Telegram: для кожної задачі — ключ, summary, статус і пряме посилання. "
+    "Якщо задач немає — так і скажи одним рядком."
+)
+PROMPT_FREE = (
+    "Покажи вільні dev-задачі. Використай Atlassian Jira MCP з "
+    f'cloudId {JIRA_CLOUD_ID} і JQL: status = "Selected for Development" AND labels = Dev. '
+    "Виведи стисло для Telegram: для кожної задачі — ключ, summary, статус і пряме посилання. "
+    "Якщо задач немає — так і скажи одним рядком."
+)
 
 
 def _gate(config: Config, update: Update) -> bool:
@@ -50,7 +78,13 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     await update.effective_message.reply_text(
-        "Hi. I'm online. Ask me anything — Jira / Outlook / local actions land in later milestones."
+        "Привіт, Вадімич. Я на зв'язку.\n\n"
+        "Команди (кнопки нижче):\n"
+        "/my — мої задачі в роботі\n"
+        "/free — вільні dev-задачі (Selected for Development)\n"
+        "/reset — очистити контекст розмови\n\n"
+        "Або просто пиши/говори природною мовою — Jira вже підключена.",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -61,6 +95,33 @@ async def _cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     agent.clear(update.effective_chat.id)
     await update.effective_message.reply_text("Thread cleared.")
+
+
+async def _run_agent_instruction(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, instruction: str
+) -> None:
+    """Route a canned instruction through the agent (shared by shortcut commands)."""
+    config: Config = ctx.application.bot_data["config"]
+    agent: Agent = ctx.application.bot_data["agent"]
+    if not _gate(config, update):
+        return
+    message = update.effective_message
+    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    try:
+        reply = await agent.reply(message.chat_id, instruction)
+    except Exception:
+        log.exception("agent failed on shortcut command")
+        await message.reply_text("Something went wrong. Check the logs.")
+        return
+    await message.reply_text(reply)
+
+
+async def _cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_agent_instruction(update, ctx, PROMPT_MY)
+
+
+async def _cmd_free(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_agent_instruction(update, ctx, PROMPT_FREE)
 
 
 async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -139,17 +200,29 @@ async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(reply)
 
 
+async def _post_init(app: Application) -> None:
+    await app.bot.set_my_commands(
+        [
+            BotCommand("my", "Мої задачі в роботі"),
+            BotCommand("free", "Вільні dev-задачі"),
+            BotCommand("reset", "Очистити контекст розмови"),
+        ]
+    )
+
+
 def build_application(
     config: Config,
     agent: Agent,
     transcriber: Transcriber | None = None,
 ) -> Application:
-    app = ApplicationBuilder().token(config.telegram_bot_token).build()
+    app = ApplicationBuilder().token(config.telegram_bot_token).post_init(_post_init).build()
     app.bot_data["config"] = config
     app.bot_data["agent"] = agent
     app.bot_data["transcriber"] = transcriber
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reset", _cmd_reset))
+    app.add_handler(CommandHandler("my", _cmd_my))
+    app.add_handler(CommandHandler("free", _cmd_free))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_handler(MessageHandler(filters.VOICE, _on_voice))
     return app
