@@ -17,7 +17,6 @@ from telegram.ext import (
 
 from .agent import Agent
 from .config import Config
-from .graph import GraphAuth, GraphAuthError, GraphClient
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
@@ -28,7 +27,7 @@ JIRA_CLOUD_ID = "5989155e-2f13-4fe3-9126-df63c85122a8"
 # Persistent tappable keyboard shown under the message input.
 # Buttons send literal "/my" etc., which the CommandHandlers pick up.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["/my", "/free"], ["/reset"]],
+    [["/my", "/free"], ["/mail", "/today", "/week"], ["/reset"]],
     resize_keyboard=True,
     is_persistent=True,
     input_field_placeholder="Команда або повідомлення…",
@@ -48,6 +47,21 @@ PROMPT_FREE = (
     f'cloudId {JIRA_CLOUD_ID} і JQL: status = "Selected for Development" AND labels = Dev. '
     "Виведи стисло для Telegram: для кожної задачі — ключ, summary, статус і пряме посилання. "
     "Якщо задач немає — так і скажи одним рядком."
+)
+PROMPT_MAIL = (
+    "Використай Microsoft 365 MCP. Покажи 10 останніх листів з моєї вхідної пошти. "
+    "Для кожного: відправник, тема, час (київський), і познач непрочитані. "
+    "Стисло для Telegram, без зайвого тексту. Якщо немає доступу — скажи чому."
+)
+PROMPT_TODAY = (
+    "Використай Microsoft 365 MCP. Покажи мої зустрічі на сьогодні. "
+    "Для кожної: час (київський), тема, і чи це Teams-онлайн (з посиланням на приєднання, якщо є). "
+    "Стисло для Telegram. Якщо зустрічей немає — скажи одним рядком."
+)
+PROMPT_WEEK = (
+    "Використай Microsoft 365 MCP. Покажи мої зустрічі на найближчі 7 днів. "
+    "Згрупуй за днями; для кожної: час (київський), тема, познач Teams-онлайн. "
+    "Скасовані не показуй. Стисло для Telegram."
 )
 
 
@@ -83,8 +97,11 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Команди (кнопки нижче):\n"
         "/my — мої задачі в роботі\n"
         "/free — вільні dev-задачі (Selected for Development)\n"
+        "/mail — останні листи\n"
+        "/today — зустрічі сьогодні\n"
+        "/week — зустрічі на тиждень\n"
         "/reset — очистити контекст розмови\n\n"
-        "Або просто пиши/говори природною мовою — Jira вже підключена.",
+        "Або просто пиши/говори природною мовою — Jira, пошта й календар підключені.",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -125,70 +142,16 @@ async def _cmd_free(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_agent_instruction(update, ctx, PROMPT_FREE)
 
 
-async def _cmd_login_ms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    config: Config = ctx.application.bot_data["config"]
-    graph_auth: GraphAuth | None = ctx.application.bot_data.get("graph_auth")
-    if not _gate(config, update):
-        return
-    message = update.effective_message
-    if graph_auth is None:
-        await message.reply_text("MS Graph не налаштований у цьому білді.")
-        return
-    try:
-        flow = graph_auth.start_device_flow()
-    except GraphAuthError as e:
-        log.warning("device flow start failed: %s", e)
-        await message.reply_text(
-            "Не вдалося почати вхід. Можливо tenant блокує device-code flow.\n\n"
-            f"Деталі: {e}"
-        )
-        return
-
-    await message.reply_text(
-        "🔐 Вхід у Microsoft 365:\n\n"
-        f"1. Відкрий {flow.verification_uri}\n"
-        f"2. Введи код: {flow.user_code}\n"
-        "3. Залогінься робочим акаунтом і підтверди доступ\n\n"
-        "Чекаю на завершення… (повідомлю коли готово)"
-    )
-
-    chat_id = message.chat_id
-
-    async def _await_completion() -> None:
-        try:
-            await graph_auth.complete_device_flow(flow)
-        except GraphAuthError as e:
-            log.warning("device flow completion failed: %s", e)
-            await ctx.bot.send_message(
-                chat_id,
-                "❌ Вхід не вдався. Tenant міг заблокувати ці права (потрібен admin consent).\n\n"
-                f"Деталі: {e}",
-            )
-            return
-        await ctx.bot.send_message(chat_id, "✅ Вхід у Microsoft 365 виконано. Тепер працюють пошта і календар.")
-
-    ctx.application.create_task(_await_completion())
+async def _cmd_mail(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_agent_instruction(update, ctx, PROMPT_MAIL)
 
 
-async def _cmd_whoami_ms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    config: Config = ctx.application.bot_data["config"]
-    graph_client: GraphClient | None = ctx.application.bot_data.get("graph_client")
-    if not _gate(config, update):
-        return
-    message = update.effective_message
-    if graph_client is None:
-        await message.reply_text("MS Graph не налаштований у цьому білді.")
-        return
-    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    try:
-        me = await graph_client.me()
-    except GraphAuthError as e:
-        await message.reply_text(f"Не авторизовано або помилка Graph:\n{e}")
-        return
-    await message.reply_text(
-        f"👤 {me.get('displayName')}\n"
-        f"✉️ {me.get('mail') or me.get('userPrincipalName')}"
-    )
+async def _cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_agent_instruction(update, ctx, PROMPT_TODAY)
+
+
+async def _cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _run_agent_instruction(update, ctx, PROMPT_WEEK)
 
 
 async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -272,8 +235,9 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("my", "Мої задачі в роботі"),
             BotCommand("free", "Вільні dev-задачі"),
-            BotCommand("login_ms", "Вхід у Microsoft 365"),
-            BotCommand("whoami_ms", "Перевірити вхід M365"),
+            BotCommand("mail", "Останні листи"),
+            BotCommand("today", "Зустрічі сьогодні"),
+            BotCommand("week", "Зустрічі на тиждень"),
             BotCommand("reset", "Очистити контекст розмови"),
         ]
     )
@@ -296,8 +260,9 @@ def build_application(
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("my", _cmd_my))
     app.add_handler(CommandHandler("free", _cmd_free))
-    app.add_handler(CommandHandler("login_ms", _cmd_login_ms))
-    app.add_handler(CommandHandler("whoami_ms", _cmd_whoami_ms))
+    app.add_handler(CommandHandler("mail", _cmd_mail))
+    app.add_handler(CommandHandler("today", _cmd_today))
+    app.add_handler(CommandHandler("week", _cmd_week))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_handler(MessageHandler(filters.VOICE, _on_voice))
     return app
