@@ -5,11 +5,14 @@ import logging
 from .agent import Agent
 from .config import load_config
 from .db import Db
+from .graph import GraphAuth, GraphClient
+from .sslfix import sanitize_ca_env
 from .stt import Transcriber
 from .telegram_bot import build_application
 
 
 def main() -> None:
+    sanitize_ca_env()
     config = load_config()
     logging.basicConfig(
         level=config.log_level,
@@ -40,7 +43,16 @@ def main() -> None:
             "Bot will continue serving text."
         )
 
-    app = build_application(config, agent, transcriber=transcriber)
+    graph_auth = GraphAuth(cache_path=config.db_path.parent / "msal_cache.bin")
+    graph_client = GraphClient(graph_auth)
+
+    app = build_application(
+        config,
+        agent,
+        transcriber=transcriber,
+        graph_auth=graph_auth,
+        graph_client=graph_client,
+    )
 
     log.info(
         "assistant starting; db=%s model=%s whisper=%s lang=%s",

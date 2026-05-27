@@ -17,6 +17,7 @@ from telegram.ext import (
 
 from .agent import Agent
 from .config import Config
+from .graph import GraphAuth, GraphAuthError, GraphClient
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
@@ -124,6 +125,72 @@ async def _cmd_free(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_agent_instruction(update, ctx, PROMPT_FREE)
 
 
+async def _cmd_login_ms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = ctx.application.bot_data["config"]
+    graph_auth: GraphAuth | None = ctx.application.bot_data.get("graph_auth")
+    if not _gate(config, update):
+        return
+    message = update.effective_message
+    if graph_auth is None:
+        await message.reply_text("MS Graph не налаштований у цьому білді.")
+        return
+    try:
+        flow = graph_auth.start_device_flow()
+    except GraphAuthError as e:
+        log.warning("device flow start failed: %s", e)
+        await message.reply_text(
+            "Не вдалося почати вхід. Можливо tenant блокує device-code flow.\n\n"
+            f"Деталі: {e}"
+        )
+        return
+
+    await message.reply_text(
+        "🔐 Вхід у Microsoft 365:\n\n"
+        f"1. Відкрий {flow.verification_uri}\n"
+        f"2. Введи код: {flow.user_code}\n"
+        "3. Залогінься робочим акаунтом і підтверди доступ\n\n"
+        "Чекаю на завершення… (повідомлю коли готово)"
+    )
+
+    chat_id = message.chat_id
+
+    async def _await_completion() -> None:
+        try:
+            await graph_auth.complete_device_flow(flow)
+        except GraphAuthError as e:
+            log.warning("device flow completion failed: %s", e)
+            await ctx.bot.send_message(
+                chat_id,
+                "❌ Вхід не вдався. Tenant міг заблокувати ці права (потрібен admin consent).\n\n"
+                f"Деталі: {e}",
+            )
+            return
+        await ctx.bot.send_message(chat_id, "✅ Вхід у Microsoft 365 виконано. Тепер працюють пошта і календар.")
+
+    ctx.application.create_task(_await_completion())
+
+
+async def _cmd_whoami_ms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    config: Config = ctx.application.bot_data["config"]
+    graph_client: GraphClient | None = ctx.application.bot_data.get("graph_client")
+    if not _gate(config, update):
+        return
+    message = update.effective_message
+    if graph_client is None:
+        await message.reply_text("MS Graph не налаштований у цьому білді.")
+        return
+    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    try:
+        me = await graph_client.me()
+    except GraphAuthError as e:
+        await message.reply_text(f"Не авторизовано або помилка Graph:\n{e}")
+        return
+    await message.reply_text(
+        f"👤 {me.get('displayName')}\n"
+        f"✉️ {me.get('mail') or me.get('userPrincipalName')}"
+    )
+
+
 async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = ctx.application.bot_data["config"]
     agent: Agent = ctx.application.bot_data["agent"]
@@ -205,6 +272,8 @@ async def _post_init(app: Application) -> None:
         [
             BotCommand("my", "Мої задачі в роботі"),
             BotCommand("free", "Вільні dev-задачі"),
+            BotCommand("login_ms", "Вхід у Microsoft 365"),
+            BotCommand("whoami_ms", "Перевірити вхід M365"),
             BotCommand("reset", "Очистити контекст розмови"),
         ]
     )
@@ -214,15 +283,21 @@ def build_application(
     config: Config,
     agent: Agent,
     transcriber: Transcriber | None = None,
+    graph_auth: GraphAuth | None = None,
+    graph_client: GraphClient | None = None,
 ) -> Application:
     app = ApplicationBuilder().token(config.telegram_bot_token).post_init(_post_init).build()
     app.bot_data["config"] = config
     app.bot_data["agent"] = agent
     app.bot_data["transcriber"] = transcriber
+    app.bot_data["graph_auth"] = graph_auth
+    app.bot_data["graph_client"] = graph_client
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("my", _cmd_my))
     app.add_handler(CommandHandler("free", _cmd_free))
+    app.add_handler(CommandHandler("login_ms", _cmd_login_ms))
+    app.add_handler(CommandHandler("whoami_ms", _cmd_whoami_ms))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_handler(MessageHandler(filters.VOICE, _on_voice))
     return app
