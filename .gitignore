@@ -19,3 +19,10 @@ build/
 # whisper model files — downloaded locally / cached in PVC
 models/
 *.bin
+
+# runtime logs (bot.log, bot.out.log, etc.)
+*.log
+
+# k8s secret with real tokens — only secret.example.yaml is tracked
+deploy/secret.yaml
+deploy/secret*.yaml
