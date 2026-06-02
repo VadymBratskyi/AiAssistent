@@ -4,7 +4,7 @@ import logging
 import tempfile
 from pathlib import Path
 
-from telegram import BotCommand, ReplyKeyboardMarkup, Update
+from telegram import BotCommand, ReactionTypeEmoji, ReplyKeyboardRemove, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -24,14 +24,6 @@ log = logging.getLogger(__name__)
 # Known Atlassian cloud for this user (see project CLAUDE.md).
 JIRA_CLOUD_ID = "5989155e-2f13-4fe3-9126-df63c85122a8"
 
-# Persistent tappable keyboard shown under the message input.
-# Buttons send literal "/my" etc., which the CommandHandlers pick up.
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [["/my", "/free"], ["/mail", "/today", "/week"], ["/reset"]],
-    resize_keyboard=True,
-    is_persistent=True,
-    input_field_placeholder="Команда або повідомлення…",
-)
 
 # Canned instructions for the shortcut commands. Phrased as natural requests
 # so they sit cleanly in the conversation history and the agent (which has the
@@ -65,6 +57,18 @@ PROMPT_WEEK = (
 )
 
 
+async def _react(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, emoji: str) -> None:
+    """Set a single-emoji reaction on the user's message. Best-effort — never raises."""
+    try:
+        await ctx.bot.set_message_reaction(
+            chat_id=chat_id,
+            message_id=message_id,
+            reaction=[ReactionTypeEmoji(emoji)],
+        )
+    except Exception:
+        log.debug("set_message_reaction failed", exc_info=True)
+
+
 def _gate(config: Config, update: Update) -> bool:
     chat = update.effective_chat
     user = update.effective_user
@@ -94,7 +98,7 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "Привіт, Вадімич. Я на зв'язку.\n\n"
-        "Команди (кнопки нижче):\n"
+        "Команди (в меню зліва від поля вводу):\n"
         "/my — мої задачі в роботі\n"
         "/free — вільні dev-задачі (Selected for Development)\n"
         "/mail — останні листи\n"
@@ -102,7 +106,7 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/week — зустрічі на тиждень\n"
         "/reset — очистити контекст розмови\n\n"
         "Або просто пиши/говори природною мовою — Jira, пошта й календар підключені.",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -129,9 +133,11 @@ async def _run_agent_instruction(
         reply = await agent.reply(message.chat_id, instruction)
     except Exception:
         log.exception("agent failed on shortcut command")
+        await _react(ctx, message.chat_id, message.message_id, "🤯")
         await message.reply_text("Something went wrong. Check the logs.")
         return
     await message.reply_text(reply)
+    await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
 async def _cmd_my(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -168,9 +174,11 @@ async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply = await agent.reply(message.chat_id, message.text)
     except Exception:
         log.exception("agent failed")
+        await _react(ctx, message.chat_id, message.message_id, "🤯")
         await message.reply_text("Something went wrong. Check the logs.")
         return
     await message.reply_text(reply)
+    await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
 async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -225,9 +233,11 @@ async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         reply = await agent.reply(message.chat_id, transcript)
     except Exception:
         log.exception("agent failed on voice")
+        await _react(ctx, message.chat_id, message.message_id, "🤯")
         await message.reply_text("Something went wrong. Check the logs.")
         return
     await message.reply_text(reply)
+    await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
 async def _post_init(app: Application) -> None:

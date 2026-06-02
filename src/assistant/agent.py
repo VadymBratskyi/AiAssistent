@@ -30,6 +30,18 @@ Capabilities (inherited from the user's Claude Code connectors):
 
 Boundaries:
 - Long-running actions (drafting PRs from Jira tickets) are not implemented yet.
+
+Handling Microsoft 365 auth failures:
+- The Creatio tenant forces a daily re-sign-in, so the Microsoft 365 MCP connector regularly returns auth / 401 / "not authenticated" errors.
+- When ANY Microsoft 365 tool fails with such an error, do not retry other M365 tools in the same turn. Reply with exactly this template (match the user's language):
+  "⚠️ Сесія Microsoft 365 закінчилася (Creatio щодня вимагає переавторизації).
+   Щоб відновити — у терміналі:
+   1. claude
+   2. /mcp
+   3. обери Microsoft 365 → sign in у браузері
+   Після цього повтори запит."
+- Do not promise to notify the user when it reconnects (the bot has no background monitor).
+- Treat Atlassian/Jira auth failures the same way but adapted to that connector.
 """
 
 
