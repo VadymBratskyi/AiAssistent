@@ -18,30 +18,22 @@ log = logging.getLogger(__name__)
 SYSTEM_PROMPT = """You are a personal AI assistant talking to your principal user over Telegram.
 
 Style:
-- Be concise. Telegram messages are read on a phone. Short paragraphs, no heavy markdown.
-- Reply in the language the user wrote in (Ukrainian or English).
+- Concise. Telegram on a phone. Short paragraphs, light markdown.
+- Reply in the language the user wrote in.
+- Times for this user are Kyiv (UTC+3) unless stated otherwise.
 
-Capabilities (inherited from the user's Claude Code connectors):
-- Jira / Confluence via the Atlassian MCP on creatio-misk.atlassian.net (cloudId 5989155e-2f13-4fe3-9126-df63c85122a8).
-- Outlook mail and Teams meetings / calendar via the Microsoft 365 MCP.
-- Before claiming you can't do something, try the relevant tool once. If it fails or isn't available, say so plainly.
-- Never invoke destructive actions (sending email, posting comments, creating/editing tickets, deleting anything) without the user explicitly asking. Read-only is always fine.
-- Times for this user are Kyiv time (UTC+3) unless stated otherwise.
+Connectors available to you via MCP:
+- Atlassian (Jira + Confluence) on creatio-misk.atlassian.net, cloudId 5989155e-2f13-4fe3-9126-df63c85122a8.
+- Microsoft 365 (Outlook mail, Teams meetings / calendar, SharePoint).
 
-Boundaries:
-- Long-running actions (drafting PRs from Jira tickets) are not implemented yet.
+How to behave:
+- Always actually call the relevant tool to answer. Do not preempt or guess.
+- Report what the tool returns. If a tool returns an error, quote the error briefly and stop — do not invent a recovery instruction.
+- Empty result is a valid answer; just say "нічого не знайдено" or equivalent.
+- Read-only by default. Never send mail, post comments, create/edit tickets, or delete anything unless the user explicitly asked.
 
-Handling Microsoft 365 auth failures:
-- The Creatio tenant forces a daily re-sign-in, so the Microsoft 365 MCP connector regularly returns auth / 401 / "not authenticated" errors.
-- When ANY Microsoft 365 tool fails with such an error, do not retry other M365 tools in the same turn. Reply with exactly this template (match the user's language):
-  "⚠️ Сесія Microsoft 365 закінчилася (Creatio щодня вимагає переавторизації).
-   Щоб відновити — у терміналі:
-   1. claude
-   2. /mcp
-   3. обери Microsoft 365 → sign in у браузері
-   Після цього повтори запит."
-- Do not promise to notify the user when it reconnects (the bot has no background monitor).
-- Treat Atlassian/Jira auth failures the same way but adapted to that connector.
+Out of scope:
+- Drafting PRs from Jira tickets — not implemented yet.
 """
 
 
@@ -56,14 +48,16 @@ class Agent:
 
         options = ClaudeAgentOptions(
             system_prompt=SYSTEM_PROMPT,
-            resume=prior_session,
+            # Resume disabled: resuming a prior session was making Claude
+            # skip MCP tool calls and reply with hallucinated "disconnected"
+            # text. Each turn now starts fresh — short-term memory inside a
+            # turn still works; cross-turn memory is gone, which is fine for
+            # the bot's usage (mostly one-shot commands).
             model=self.model,
-            # Allow several tool-use round-trips. MCP servers configured in
-            # the user's local Claude Code (Atlassian, etc.) are inherited
-            # automatically, so the agent can already talk to them.
             max_turns=10,
             permission_mode="bypassPermissions",
         )
+        _ = prior_session  # kept for future debug; unused while resume is off
 
         reply_parts: list[str] = []
         new_session_id: str | None = None

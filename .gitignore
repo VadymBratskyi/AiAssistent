@@ -22,6 +22,7 @@ models/
 
 # runtime logs (bot.log, bot.out.log, etc.)
 *.log
+logs/
 
 # k8s secret with real tokens — only secret.example.yaml is tracked
 deploy/secret.yaml
