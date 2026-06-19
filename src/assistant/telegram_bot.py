@@ -115,7 +115,7 @@ async def _cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     agent: Agent = ctx.application.bot_data["agent"]
     if not _gate(config, update):
         return
-    agent.clear(update.effective_chat.id)
+    await agent.clear(update.effective_chat.id)
     await update.effective_message.reply_text("Thread cleared.")
 
 

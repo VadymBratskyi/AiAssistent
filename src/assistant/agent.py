@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from dataclasses import dataclass
+from collections import defaultdict
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     TextBlock,
-    query,
 )
 
 from .db import Db
@@ -37,64 +38,81 @@ Out of scope:
 """
 
 
-@dataclass
 class Agent:
-    db: Db
-    model: str | None = None  # None = SDK default
+    """Long-lived `claude` subprocess per chat — keeps conversation context
+    in-memory across turns without the on-disk resume that caused tool-use
+    skipping."""
 
-    async def reply(self, chat_id: int, user_message: str) -> str:
-        self.db.append_message(chat_id, "user", user_message)
-        prior_session = self.db.get_session_id(chat_id)
+    def __init__(self, db: Db, model: str | None = None) -> None:
+        self.db = db
+        self.model = model
+        self._clients: dict[int, ClaudeSDKClient] = {}
+        # Per-chat lock so two messages from the same chat don't race on the
+        # same client (the SDK is not safe for overlapping query() calls).
+        self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
-        options = ClaudeAgentOptions(
+    def _options(self) -> ClaudeAgentOptions:
+        return ClaudeAgentOptions(
             system_prompt=SYSTEM_PROMPT,
-            # Resume disabled: resuming a prior session was making Claude
-            # skip MCP tool calls and reply with hallucinated "disconnected"
-            # text. Each turn now starts fresh — short-term memory inside a
-            # turn still works; cross-turn memory is gone, which is fine for
-            # the bot's usage (mostly one-shot commands).
             model=self.model,
             max_turns=10,
             permission_mode="bypassPermissions",
         )
-        _ = prior_session  # kept for future debug; unused while resume is off
 
-        reply_parts: list[str] = []
-        new_session_id: str | None = None
-        usage_info: dict | None = None
+    async def _client(self, chat_id: int) -> ClaudeSDKClient:
+        client = self._clients.get(chat_id)
+        if client is None:
+            client = ClaudeSDKClient(options=self._options())
+            await client.connect()
+            self._clients[chat_id] = client
+            log.info("opened claude session chat_id=%s", chat_id)
+        return client
 
+    async def _drop_client(self, chat_id: int) -> None:
+        client = self._clients.pop(chat_id, None)
+        if client is None:
+            return
         try:
-            async for msg in query(prompt=user_message, options=options):
-                if isinstance(msg, AssistantMessage):
-                    for block in msg.content:
-                        if isinstance(block, TextBlock):
-                            reply_parts.append(block.text)
-                elif isinstance(msg, ResultMessage):
-                    new_session_id = getattr(msg, "session_id", None)
-                    usage_info = getattr(msg, "usage", None)
+            await client.disconnect()
         except Exception:
-            log.exception("Claude Agent SDK query failed (chat_id=%s)", chat_id)
-            # If session resume was the culprit, drop it so next call starts fresh.
-            if prior_session:
-                self.db.set_session_id(chat_id, "")
-            raise
+            log.debug("disconnect failed for chat_id=%s", chat_id, exc_info=True)
 
-        reply_text = "\n".join(reply_parts).strip() or "(no response)"
+    async def reply(self, chat_id: int, user_message: str) -> str:
+        self.db.append_message(chat_id, "user", user_message)
 
-        if new_session_id:
-            self.db.set_session_id(chat_id, new_session_id)
+        async with self._locks[chat_id]:
+            try:
+                reply_text = await self._send(chat_id, user_message)
+            except Exception:
+                # Subprocess may be stuck or dead — drop and retry once with
+                # a fresh client. Conversation context for that chat is lost.
+                log.warning("claude session error chat_id=%s; recreating", chat_id, exc_info=True)
+                await self._drop_client(chat_id)
+                reply_text = await self._send(chat_id, user_message)
+
         self.db.append_message(chat_id, "assistant", reply_text)
-
-        log.info(
-            "claude reply chat_id=%s resumed=%s new_session=%s usage=%s",
-            chat_id,
-            bool(prior_session),
-            bool(new_session_id),
-            usage_info,
-        )
         return reply_text
 
-    def clear(self, chat_id: int) -> None:
+    async def _send(self, chat_id: int, user_message: str) -> str:
+        client = await self._client(chat_id)
+        await client.query(user_message)
+
+        text_parts: list[str] = []
+        usage_info = None
+        async for msg in client.receive_response():
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        text_parts.append(block.text)
+            elif isinstance(msg, ResultMessage):
+                usage_info = getattr(msg, "usage", None)
+
+        reply_text = "\n".join(text_parts).strip() or "(no response)"
+        log.info("claude reply chat_id=%s usage=%s", chat_id, usage_info)
+        return reply_text
+
+    async def clear(self, chat_id: int) -> None:
+        await self._drop_client(chat_id)
         self.db.clear_thread(chat_id)
 
 
