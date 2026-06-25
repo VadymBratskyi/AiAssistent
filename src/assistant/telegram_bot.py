@@ -59,6 +59,7 @@ PROMPT_WEEK = (
 
 
 SCREENSHOTS_DIR = Path("/tmp/assistant-screenshots")
+INBOX_DIR = Path("/tmp/assistant-inbox")
 
 
 async def _flush_screenshots(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -277,6 +278,51 @@ async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
+async def _on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    agent: Agent = ctx.application.bot_data["agent"]
+    if not _gate(ctx, update):
+        return
+    message = update.effective_message
+    if not message or not message.photo:
+        return
+
+    # Telegram delivers a list of sizes — biggest is last.
+    photo = message.photo[-1]
+    caption = (message.caption or "").strip() or "Опиши що зображено на цьому фото."
+
+    INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    file_path = INBOX_DIR / f"{photo.file_unique_id}.jpg"
+    try:
+        tg_file = await photo.get_file()
+        await tg_file.download_to_drive(file_path)
+    except Exception:
+        log.exception("photo download failed")
+        await message.reply_text("Не вдалось завантажити фото.")
+        return
+
+    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    prompt = (
+        f"Користувач надіслав зображення. Скористайся Read tool щоб подивитись файл "
+        f"{file_path} (це підтримує зображення) і дай відповідь українською на: {caption}"
+    )
+    try:
+        reply = await agent.reply(message.chat_id, prompt)
+    except Exception:
+        log.exception("agent failed on photo")
+        await _react(ctx, message.chat_id, message.message_id, "🤯")
+        await message.reply_text("Something went wrong. Check the logs.")
+        return
+    finally:
+        try:
+            file_path.unlink()
+        except OSError:
+            pass
+
+    await message.reply_text(reply)
+    await _flush_screenshots(ctx, message.chat_id)
+    await _react(ctx, message.chat_id, message.message_id, "👍")
+
+
 async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = ctx.application.bot_data["config"]
     agent: Agent = ctx.application.bot_data["agent"]
@@ -376,4 +422,5 @@ def build_application(
     app.add_handler(CommandHandler("revoke", _cmd_revoke))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_handler(MessageHandler(filters.VOICE, _on_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, _on_photo))
     return app
