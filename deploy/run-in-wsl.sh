@@ -38,6 +38,8 @@ docker run -d \
     -v "$CLAUDE_DIR":/home/assistant/.claude \
     -v "$CLAUDE_JSON":/home/assistant/.claude.json \
     -v "$MODELS_DIR":/models:ro \
+    -v /mnt/c:/host/c:ro \
+    -v /mnt/d:/host/d:ro \
     -v assistant-data:/data \
     "$IMAGE"
 
