@@ -17,6 +17,7 @@ from telegram.ext import (
 
 from .agent import Agent
 from .config import Config
+from .db import Db
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
@@ -69,31 +70,44 @@ async def _react(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, 
         log.debug("set_message_reaction failed", exc_info=True)
 
 
-def _gate(config: Config, update: Update) -> bool:
-    chat = update.effective_chat
+def _gate(ctx: ContextTypes.DEFAULT_TYPE, update: Update) -> bool:
     user = update.effective_user
-    if chat is None:
+    if user is None:
         return False
-    if not config.is_chat_allowed(chat.id):
+    from .db import Db
+
+    db: Db = ctx.application.bot_data["db"]
+    if not db.is_user_allowed(user.id):
         log.warning(
-            "rejected message from non-allowlisted chat_id=%s username=%s",
-            chat.id,
-            user.username if user else None,
+            "rejected message from non-allowlisted user_id=%s username=%s",
+            user.id,
+            user.username,
         )
         return False
+    # Keep username fresh — useful for /users display and audit.
+    db.update_username(user.id, user.username)
     return True
 
 
+def _is_admin(ctx: ContextTypes.DEFAULT_TYPE, update: Update) -> bool:
+    user = update.effective_user
+    if user is None:
+        return False
+    from .db import Db
+
+    db: Db = ctx.application.bot_data["db"]
+    return db.is_user_admin(user.id)
+
+
 async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    config: Config = ctx.application.bot_data["config"]
-    chat = update.effective_chat
-    if chat is None:
+    user = update.effective_user
+    if user is None:
         return
-    if not config.is_chat_allowed(chat.id):
-        log.info("/start from non-allowlisted chat_id=%s — add this id to TELEGRAM_ALLOWED_CHAT_IDS", chat.id)
+    if not _gate(ctx, update):
         await update.effective_message.reply_text(
-            f"This bot is single-user. Your chat_id is {chat.id}. "
-            "Add it to TELEGRAM_ALLOWED_CHAT_IDS and restart the bot."
+            f"Цей бот приватний. Твій Telegram user_id: {user.id}"
+            + (f" (@{user.username})" if user.username else "")
+            + ".\nПопроси адміністратора надати доступ: /grant " + str(user.id)
         )
         return
     await update.effective_message.reply_text(
@@ -113,7 +127,7 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def _cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = ctx.application.bot_data["config"]
     agent: Agent = ctx.application.bot_data["agent"]
-    if not _gate(config, update):
+    if not _gate(ctx, update):
         return
     await agent.clear(update.effective_chat.id)
     await update.effective_message.reply_text("Thread cleared.")
@@ -125,7 +139,7 @@ async def _run_agent_instruction(
     """Route a canned instruction through the agent (shared by shortcut commands)."""
     config: Config = ctx.application.bot_data["config"]
     agent: Agent = ctx.application.bot_data["agent"]
-    if not _gate(config, update):
+    if not _gate(ctx, update):
         return
     message = update.effective_message
     await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
@@ -160,10 +174,68 @@ async def _cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_agent_instruction(update, ctx, PROMPT_WEEK)
 
 
+# ---- admin: user management ------------------------------------------------
+
+async def _cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update) or not _is_admin(ctx, update):
+        return
+    from .db import Db
+
+    db: Db = ctx.application.bot_data["db"]
+    rows = db.list_users()
+    if not rows:
+        await update.effective_message.reply_text("Користувачів немає.")
+        return
+    lines = ["Дозволені користувачі:"]
+    for uid, username, is_admin, _ in rows:
+        flag = " 👑" if is_admin else ""
+        name = f"@{username}" if username else "?"
+        lines.append(f"• {uid} {name}{flag}")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def _cmd_grant(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update) or not _is_admin(ctx, update):
+        return
+    msg = update.effective_message
+    args = ctx.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await msg.reply_text("Використання: /grant <user_id> [@username]")
+        return
+    user_id = int(args[0])
+    username = args[1].lstrip("@") if len(args) > 1 else None
+    from .db import Db
+
+    db: Db = ctx.application.bot_data["db"]
+    db.add_user(user_id, username=username, is_admin=False)
+    await msg.reply_text(f"✅ Додано: {user_id}" + (f" (@{username})" if username else ""))
+
+
+async def _cmd_revoke(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update) or not _is_admin(ctx, update):
+        return
+    msg = update.effective_message
+    args = ctx.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await msg.reply_text("Використання: /revoke <user_id>")
+        return
+    user_id = int(args[0])
+    if user_id == update.effective_user.id:
+        await msg.reply_text("Не можна відкликати себе.")
+        return
+    from .db import Db
+
+    db: Db = ctx.application.bot_data["db"]
+    if db.remove_user(user_id):
+        await msg.reply_text(f"🗑 Видалено: {user_id}")
+    else:
+        await msg.reply_text(f"Користувача {user_id} не знайдено.")
+
+
 async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = ctx.application.bot_data["config"]
     agent: Agent = ctx.application.bot_data["agent"]
-    if not _gate(config, update):
+    if not _gate(ctx, update):
         return
     message = update.effective_message
     if message is None or not message.text:
@@ -185,7 +257,7 @@ async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     config: Config = ctx.application.bot_data["config"]
     agent: Agent = ctx.application.bot_data["agent"]
     transcriber: Transcriber | None = ctx.application.bot_data.get("transcriber")
-    if not _gate(config, update):
+    if not _gate(ctx, update):
         return
     message = update.effective_message
     voice = message.voice if message else None
@@ -249,6 +321,9 @@ async def _post_init(app: Application) -> None:
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
             BotCommand("reset", "Очистити контекст розмови"),
+            BotCommand("users", "(admin) Список користувачів"),
+            BotCommand("grant", "(admin) Додати користувача"),
+            BotCommand("revoke", "(admin) Видалити користувача"),
         ]
     )
 
@@ -256,16 +331,14 @@ async def _post_init(app: Application) -> None:
 def build_application(
     config: Config,
     agent: Agent,
+    db: Db,
     transcriber: Transcriber | None = None,
-    graph_auth: GraphAuth | None = None,
-    graph_client: GraphClient | None = None,
 ) -> Application:
     app = ApplicationBuilder().token(config.telegram_bot_token).post_init(_post_init).build()
     app.bot_data["config"] = config
     app.bot_data["agent"] = agent
+    app.bot_data["db"] = db
     app.bot_data["transcriber"] = transcriber
-    app.bot_data["graph_auth"] = graph_auth
-    app.bot_data["graph_client"] = graph_client
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("my", _cmd_my))
@@ -273,6 +346,9 @@ def build_application(
     app.add_handler(CommandHandler("mail", _cmd_mail))
     app.add_handler(CommandHandler("today", _cmd_today))
     app.add_handler(CommandHandler("week", _cmd_week))
+    app.add_handler(CommandHandler("users", _cmd_users))
+    app.add_handler(CommandHandler("grant", _cmd_grant))
+    app.add_handler(CommandHandler("revoke", _cmd_revoke))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _on_text))
     app.add_handler(MessageHandler(filters.VOICE, _on_voice))
     return app

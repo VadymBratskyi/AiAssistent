@@ -27,6 +27,13 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_chat_id_id ON messages(chat_id, id);
+
+CREATE TABLE IF NOT EXISTS allowed_users (
+    user_id    INTEGER PRIMARY KEY,
+    username   TEXT,
+    is_admin   INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -98,3 +105,57 @@ class Db:
                 "UPDATE threads SET session_id=?, updated_at=? WHERE chat_id=?",
                 (session_id, int(time.time()), chat_id),
             )
+
+    # ---- user allowlist -------------------------------------------------
+
+    def is_user_allowed(self, user_id: int) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM allowed_users WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return row is not None
+
+    def is_user_admin(self, user_id: int) -> bool:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT is_admin FROM allowed_users WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return bool(row and row[0])
+
+    def add_user(self, user_id: int, username: str | None = None, is_admin: bool = False) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO allowed_users(user_id, username, is_admin, created_at) "
+                "VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET "
+                "  username=COALESCE(excluded.username, allowed_users.username), "
+                "  is_admin=excluded.is_admin",
+                (user_id, username, 1 if is_admin else 0, int(time.time())),
+            )
+
+    def update_username(self, user_id: int, username: str | None) -> None:
+        if not username:
+            return
+        with self._conn() as c:
+            c.execute(
+                "UPDATE allowed_users SET username=? WHERE user_id=? AND (username IS NULL OR username != ?)",
+                (username, user_id, username),
+            )
+
+    def remove_user(self, user_id: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute("DELETE FROM allowed_users WHERE user_id=?", (user_id,))
+            return cur.rowcount > 0
+
+    def list_users(self) -> list[tuple[int, str | None, bool, int]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT user_id, username, is_admin, created_at "
+                "FROM allowed_users ORDER BY created_at",
+            ).fetchall()
+        return [(uid, name, bool(adm), ts) for uid, name, adm, ts in rows]
+
+    def count_users(self) -> int:
+        with self._conn() as c:
+            (n,) = c.execute("SELECT COUNT(*) FROM allowed_users").fetchone()
+        return n

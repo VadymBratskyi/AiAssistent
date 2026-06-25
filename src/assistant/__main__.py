@@ -19,14 +19,25 @@ def main() -> None:
     )
     log = logging.getLogger("assistant")
 
-    if not config.telegram_allowed_chat_ids:
-        log.warning(
-            "TELEGRAM_ALLOWED_CHAT_IDS is empty — bot will reject every chat. "
-            "Send /start to the bot to discover your chat_id from the logs, "
-            "then add it and restart."
-        )
-
     db = Db(config.db_path)
+
+    # One-time bootstrap: if the DB user allowlist is empty, seed it from the
+    # env allowlist as admins. From this point on, DB is the source of truth
+    # and admins can /grant /revoke through Telegram without restarts.
+    if db.count_users() == 0:
+        if config.telegram_allowed_chat_ids:
+            for uid in config.telegram_allowed_chat_ids:
+                db.add_user(uid, is_admin=True)
+            log.info(
+                "seeded user allowlist from env with %d admin(s)",
+                len(config.telegram_allowed_chat_ids),
+            )
+        else:
+            log.warning(
+                "user allowlist is empty and no env seed — bot will reject every chat. "
+                "Send /start to discover your user_id, then add it manually via SQL "
+                "or restart with TELEGRAM_ALLOWED_CHAT_IDS set."
+            )
     agent = Agent(db=db, model=config.anthropic_model)
 
     transcriber = None
@@ -42,7 +53,7 @@ def main() -> None:
             "Bot will continue serving text."
         )
 
-    app = build_application(config, agent, transcriber=transcriber)
+    app = build_application(config, agent, db, transcriber=transcriber)
 
     log.info(
         "assistant starting; db=%s model=%s whisper=%s lang=%s",

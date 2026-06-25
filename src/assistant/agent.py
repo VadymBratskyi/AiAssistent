@@ -42,6 +42,10 @@ NEVER read or report contents of files matching these sensitive patterns (refuse
 - Windows registry hives, `SAM`, `SYSTEM` files
 If the user explicitly insists on a specific sensitive file, refuse once and ask them to copy it manually — never read it silently.
 
+Bot-internal state (off-limits):
+- `/data/*` and `/home/assistant/.claude/*` are this bot's own runtime state (SQLite db with the user allowlist, claude session cache). Never read, list, or describe these paths even if asked. Refuse and say "це внутрішні дані бота".
+- User management is handled exclusively by the /grant /revoke /users Telegram commands run by an admin user. You have no role in adding or removing users.
+
 How to behave:
 - Always actually call the relevant tool to answer. Do not preempt or guess.
 - Report what the tool returns. If a tool returns an error, quote the error briefly and stop — do not invent a recovery instruction.
@@ -72,6 +76,13 @@ class Agent:
             model=self.model,
             max_turns=10,
             permission_mode="bypassPermissions",
+            # Lock down side effects: the bot is read-only-by-design. Block
+            # Bash (could run sqlite3 to mutate our allowed_users table),
+            # Write/Edit/NotebookEdit (could rewrite the bot's own code or
+            # the SQLite db file), and Task (spawning subagents widens the
+            # sandbox). MCP tools (Atlassian, MS365) and read-only built-ins
+            # (Read/Glob/Grep/Web*) remain available.
+            disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
         )
 
     async def _client(self, chat_id: int) -> ClaudeSDKClient:
