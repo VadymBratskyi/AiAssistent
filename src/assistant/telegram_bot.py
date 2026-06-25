@@ -58,6 +58,28 @@ PROMPT_WEEK = (
 )
 
 
+SCREENSHOTS_DIR = Path("/tmp/assistant-screenshots")
+
+
+async def _flush_screenshots(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """Send any new Playwright screenshots into the chat, then delete them."""
+    if not SCREENSHOTS_DIR.exists():
+        return
+    for path in sorted(SCREENSHOTS_DIR.iterdir()):
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+            continue
+        try:
+            with path.open("rb") as fh:
+                await ctx.bot.send_photo(chat_id=chat_id, photo=fh)
+        except Exception:
+            log.exception("send_photo failed for %s", path)
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 async def _react(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, emoji: str) -> None:
     """Set a single-emoji reaction on the user's message. Best-effort — never raises."""
     try:
@@ -151,6 +173,7 @@ async def _run_agent_instruction(
         await message.reply_text("Something went wrong. Check the logs.")
         return
     await message.reply_text(reply)
+    await _flush_screenshots(ctx, message.chat_id)
     await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
@@ -250,6 +273,7 @@ async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Something went wrong. Check the logs.")
         return
     await message.reply_text(reply)
+    await _flush_screenshots(ctx, message.chat_id)
     await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
@@ -309,6 +333,7 @@ async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text("Something went wrong. Check the logs.")
         return
     await message.reply_text(reply)
+    await _flush_screenshots(ctx, message.chat_id)
     await _react(ctx, message.chat_id, message.message_id, "👍")
 
 

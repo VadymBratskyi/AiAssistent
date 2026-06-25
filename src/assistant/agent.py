@@ -26,6 +26,8 @@ Style:
 Connectors available to you via MCP:
 - Atlassian (Jira + Confluence) on creatio-misk.atlassian.net, cloudId 5989155e-2f13-4fe3-9126-df63c85122a8.
 - Microsoft 365 (Outlook mail, Teams meetings / calendar, SharePoint).
+- Playwright (headless Chromium in the container, isolated profile per session). Use it for opening URLs, scraping public pages, taking screenshots, or testing public web flows. The browser has NO logins — it cannot access anything that requires authentication.
+  - When the user asks for "скріншот / screenshot / знімок / фото сторінки / зображення", you MUST call the `browser_take_screenshot` tool (which writes a PNG to disk). Do NOT substitute `browser_snapshot` (DOM-only YAML) and do NOT fabricate a filename — only mention files that the screenshot tool actually returned. The bot auto-attaches any PNGs you produced to the chat after your reply.
 
 Local filesystem access (read-only):
 - The host's drives are mounted read-only inside the container:
@@ -80,9 +82,38 @@ class Agent:
             # Bash (could run sqlite3 to mutate our allowed_users table),
             # Write/Edit/NotebookEdit (could rewrite the bot's own code or
             # the SQLite db file), and Task (spawning subagents widens the
-            # sandbox). MCP tools (Atlassian, MS365) and read-only built-ins
-            # (Read/Glob/Grep/Web*) remain available.
+            # sandbox). MCP tools (Atlassian, MS365, Playwright) and
+            # read-only built-ins (Read/Glob/Grep/Web*) remain available.
             disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
+            # In-container browser automation. Headless Chromium, isolated
+            # profile per session — no persistent cookies or logins.
+            mcp_servers={
+                "playwright": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": [
+                        "--yes",
+                        "@playwright/mcp@latest",
+                        "--headless",
+                        "--isolated",
+                        # @playwright/mcp's --browser only accepts
+                        # chrome/firefox/webkit/msedge (no "chromium"). Point
+                        # it at the chromium binary we downloaded to
+                        # /opt/playwright at build time.
+                        "--executable-path",
+                        "/opt/playwright/chromium-1228/chrome-linux64/chrome",
+                        # Enable the "vision" capability — without this the
+                        # browser_take_screenshot tool isn't even registered.
+                        "--caps",
+                        "vision",
+                        # Output dir is swept by the bot after each turn so
+                        # screenshots get posted into the Telegram chat.
+                        "--output-dir",
+                        "/tmp/assistant-screenshots",
+                    ],
+                    "env": {"PLAYWRIGHT_BROWSERS_PATH": "/opt/playwright"},
+                },
+            },
         )
 
     async def _client(self, chat_id: int) -> ClaudeSDKClient:
