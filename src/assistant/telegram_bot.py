@@ -17,6 +17,7 @@ from telegram.ext import (
 
 from .agent import Agent
 from .config import Config
+from .credmon import CredentialsMonitor
 from .db import Db
 from .stt import Transcriber
 
@@ -145,6 +146,26 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Або просто пиши/говори природною мовою — Jira, пошта й календар підключені.",
         reply_markup=ReplyKeyboardRemove(),
     )
+
+
+LOGIN_HELP = (
+    "🔐 Це не команда бота — це команда `claude` CLI на хості.\n\n"
+    "Щоб оновити авторизацію Claude (яку використовують пошта / Jira / wiki):\n"
+    "1. Відкрий термінал на своєму ПК\n"
+    "2. Виконай `claude`\n"
+    "3. Всередині CLI набери `/login`\n"
+    "4. Пройди вхід у браузері\n\n"
+    "Готово — бот сам підхопить свіжий токен через 10-20 секунд.\n\n"
+    "_Чому це трапляється: IDE-плагін і бот ділять один OAuth-файл, "
+    "і при паралельному refresh Anthropic ротує токен так, що один із "
+    "клієнтів залишається зі старим. Не наш баг, обхід — раз на день перелогінитись._"
+)
+
+
+async def _cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    await update.effective_message.reply_text(LOGIN_HELP, parse_mode="Markdown")
 
 
 async def _cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -383,7 +404,22 @@ async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
+async def _notify_admins(app: Application, text: str) -> None:
+    """Push a message to every admin user in the allowlist."""
+    db: Db = app.bot_data["db"]
+    for user_id, _username, is_admin, _ in db.list_users():
+        if not is_admin:
+            continue
+        try:
+            await app.bot.send_message(chat_id=user_id, text=text)
+        except Exception:
+            log.exception("failed to push admin notification to %s", user_id)
+
+
 async def _post_init(app: Application) -> None:
+    monitor = CredentialsMonitor(notify=lambda text: _notify_admins(app, text))
+    monitor.start()
+    app.bot_data["credmon"] = monitor
     await app.bot.set_my_commands(
         [
             BotCommand("my", "Мої задачі в роботі"),
@@ -392,6 +428,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
             BotCommand("reset", "Очистити контекст розмови"),
+            BotCommand("login", "Інструкція як оновити Claude auth"),
             BotCommand("users", "(admin) Список користувачів"),
             BotCommand("grant", "(admin) Додати користувача"),
             BotCommand("revoke", "(admin) Видалити користувача"),
@@ -412,6 +449,7 @@ def build_application(
     app.bot_data["transcriber"] = transcriber
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reset", _cmd_reset))
+    app.add_handler(CommandHandler("login", _cmd_login))
     app.add_handler(CommandHandler("my", _cmd_my))
     app.add_handler(CommandHandler("free", _cmd_free))
     app.add_handler(CommandHandler("mail", _cmd_mail))
