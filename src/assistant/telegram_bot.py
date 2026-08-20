@@ -168,16 +168,9 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.effective_message.reply_text(
         "Привіт, Вадімич. Я на зв'язку.\n\n"
-        "Команди (в меню зліва від поля вводу):\n"
-        "/my — мої задачі в роботі\n"
-        "/free — вільні dev-задачі (Selected for Development)\n"
-        "/mail — останні листи\n"
-        "/today — зустрічі сьогодні\n"
-        "/week — зустрічі на тиждень\n"
-        "/remember, /memory, /forget — довгострокова пам'ять\n"
-        "/reset — очистити контекст розмови\n\n"
-        "Пиши/говори природною мовою — Jira, пошта й календар підключені. "
-        "Після відповіді я можу запропонувати запам'ятати важливий факт про тебе.",
+        "Пиши/говори природною мовою або тапни `/` для меню команд.\n"
+        "Повна довідка: /help",
+        parse_mode="Markdown",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -200,6 +193,63 @@ async def _cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _gate(ctx, update):
         return
     await update.effective_message.reply_text(LOGIN_HELP, parse_mode="Markdown")
+
+
+HELP_HEADER = (
+    "🤖 *Персональний AI-асистент Вадімича*\n\n"
+    "Допомагаю з Jira, поштою, календарем Teams, Confluence-wiki, читаю "
+    "твої репозиторії, дивлюсь у браузер, відповідаю на голос і фото. "
+    "Пам'ятаю важливе про тебе між сесіями.\n\n"
+)
+
+HELP_BODY = (
+    "📌 *Jira*\n"
+    "/my — мої задачі в роботі\n"
+    "/free — вільні dev-задачі (Selected for Development)\n\n"
+    "✉️ *Пошта і календар (MS365)*\n"
+    "/mail — 10 останніх листів\n"
+    "/today — зустрічі сьогодні (з Teams-лінками)\n"
+    "/week — зустрічі на 7 днів\n"
+    "/teams `[запит]` — підсумок Teams-чатів (арг: нік або тема)\n\n"
+    "🌅 *Проактивно*\n"
+    "/morning — ранковий бриф на вимогу\n"
+    "_(автоматично о 08:30 буднями)_\n\n"
+    "⏰ *Нагадування*\n"
+    "/remind `<коли> <текст>` — напр. `через 15 хв тест`, `завтра о 9 демо`\n"
+    "/reminders — список активних\n"
+    "/unremind `<id>` — скасувати\n\n"
+    "🧠 *Довгострокова пам'ять*\n"
+    "/remember `<факт>` — запам'ятати про мене\n"
+    "/memory — показати що бот пам'ятає\n"
+    "/forget `<підрядок>` — забути\n\n"
+    "🔐 *Авторизація Claude*\n"
+    "/login — інструкція як оновити токен вручну\n"
+    "/reauth — запустити `claude login` на хості (потрібен host-helper)\n\n"
+    "🔧 *Інше*\n"
+    "/reset — очистити контекст поточної розмови\n"
+    "/start — привітання і швидке меню\n"
+    "/help — ця довідка\n\n"
+    "🗣 *Природна мова*\n"
+    "Пиши/говори як людині. Розумію українську й англійську, приймаю "
+    "голосові й фото. Можу читати твої файли з `C:\\` і `D:\\` "
+    "(окрім секретів), відкривати сторінки й робити скріншоти.\n"
+)
+
+HELP_ADMIN = (
+    "\n👑 *Admin*\n"
+    "/users — список дозволених користувачів\n"
+    "/grant `<user_id> [@name]` — додати\n"
+    "/revoke `<user_id>` — видалити\n"
+)
+
+
+async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    text = HELP_HEADER + HELP_BODY
+    if _is_admin(ctx, update):
+        text += HELP_ADMIN
+    await update.effective_message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
 
 
 def _reauth_keyboard() -> InlineKeyboardMarkup:
@@ -761,6 +811,7 @@ async def _post_init(app: Application) -> None:
     app.bot_data["reminders"] = reminders
     await app.bot.set_my_commands(
         [
+            BotCommand("help", "Довідка про бота і команди"),
             BotCommand("my", "Мої задачі в роботі"),
             BotCommand("free", "Вільні dev-задачі"),
             BotCommand("mail", "Останні листи"),
@@ -800,6 +851,7 @@ def build_application(
     # Ephemeral store: message_id → proposed memory candidate awaiting user y/n.
     app.bot_data["mem_pending"] = {}
     app.add_handler(CommandHandler("start", _cmd_start))
+    app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("login", _cmd_login))
     app.add_handler(CommandHandler("reauth", _cmd_reauth))
