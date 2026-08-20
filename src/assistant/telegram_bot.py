@@ -31,6 +31,7 @@ from .db import Db
 from .host_helper import HostHelper, HostHelperError
 from .memory import Memory
 from .morning import BRIEF_PROMPT, MorningBrief
+from .reminders import RemindersScheduler
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
@@ -311,6 +312,79 @@ async def _run_brief(app: Application, prompt: str) -> str:
     """Run the agent stateless for the morning brief."""
     agent: Agent = app.bot_data["agent"]
     return await agent.one_shot(prompt)
+
+
+def _fmt_kyiv(ts: int) -> str:
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(ts, ZoneInfo("Europe/Kyiv")).strftime("%d.%m %H:%M")
+
+
+async def _cmd_remind(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    message = update.effective_message
+    agent: Agent = ctx.application.bot_data["agent"]
+    db: Db = ctx.application.bot_data["db"]
+    args = " ".join(ctx.args or []).strip()
+    if not args:
+        await message.reply_text(
+            "Використання: `/remind <коли> <текст>`\n"
+            "Наприклад:\n"
+            "• `/remind через 15 хв перевірити білд`\n"
+            "• `/remind завтра о 09:00 підготувати демо`\n"
+            "• `/remind у п'ятницю о 15 подзвонити Івану`",
+            parse_mode="Markdown",
+        )
+        return
+    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    parsed = await agent.parse_reminder(args)
+    if parsed is None:
+        await message.reply_text(
+            "🤔 Не зрозумів час. Спробуй по-іншому — напр. `через 30 хв`, `завтра о 9`, `08.09 15:00`.",
+            parse_mode="Markdown",
+        )
+        return
+    fire_at, text = parsed
+    now = int(__import__("time").time())
+    if fire_at <= now:
+        await message.reply_text("⛔ Час нагадування уже в минулому. Уточни коли саме.")
+        return
+    rid = db.add_reminder(update.effective_user.id, fire_at, text)
+    await message.reply_text(
+        f"⏰ Нагадаю о *{_fmt_kyiv(fire_at)}*:\n_{text}_\n\n"
+        f"Скасувати: `/unremind {rid}`",
+        parse_mode="Markdown",
+    )
+
+
+async def _cmd_reminders(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    db: Db = ctx.application.bot_data["db"]
+    rows = db.list_upcoming_reminders(update.effective_user.id)
+    if not rows:
+        await update.effective_message.reply_text("Немає активних нагадувань.")
+        return
+    lines = ["⏰ Активні нагадування:"]
+    for rid, fire_at, text in rows:
+        lines.append(f"• `{rid}` — *{_fmt_kyiv(fire_at)}* — {text}")
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _cmd_unremind(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    db: Db = ctx.application.bot_data["db"]
+    args = ctx.args or []
+    if not args or not args[0].isdigit():
+        await update.effective_message.reply_text("Використання: `/unremind <id>`", parse_mode="Markdown")
+        return
+    rid = int(args[0])
+    if db.cancel_reminder(rid, update.effective_user.id):
+        await update.effective_message.reply_text(f"🗑 Скасував нагадування `{rid}`.", parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(f"Не знайшов нагадування `{rid}` серед твоїх активних.", parse_mode="Markdown")
 
 
 async def _cmd_morning(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -643,6 +717,16 @@ async def _post_init(app: Application) -> None:
     )
     brief.start()
     app.bot_data["morning"] = brief
+
+    async def _push_reminder(user_id: int, text: str) -> None:
+        try:
+            await app.bot.send_message(chat_id=user_id, text=text)
+        except Exception:
+            log.exception("failed to push reminder to %s", user_id)
+
+    reminders = RemindersScheduler(db=app.bot_data["db"], push=_push_reminder)
+    reminders.start()
+    app.bot_data["reminders"] = reminders
     await app.bot.set_my_commands(
         [
             BotCommand("my", "Мої задачі в роботі"),
@@ -651,6 +735,9 @@ async def _post_init(app: Application) -> None:
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
             BotCommand("morning", "Ранковий бриф зараз"),
+            BotCommand("remind", "Створити нагадування"),
+            BotCommand("reminders", "Активні нагадування"),
+            BotCommand("unremind", "Скасувати нагадування"),
             BotCommand("reset", "Очистити контекст розмови"),
             BotCommand("remember", "Запам'ятати факт про мене"),
             BotCommand("memory", "Показати що бот пам'ятає"),
@@ -693,6 +780,9 @@ def build_application(
     app.add_handler(CommandHandler("today", _cmd_today))
     app.add_handler(CommandHandler("week", _cmd_week))
     app.add_handler(CommandHandler("morning", _cmd_morning))
+    app.add_handler(CommandHandler("remind", _cmd_remind))
+    app.add_handler(CommandHandler("reminders", _cmd_reminders))
+    app.add_handler(CommandHandler("unremind", _cmd_unremind))
     app.add_handler(CommandHandler("users", _cmd_users))
     app.add_handler(CommandHandler("grant", _cmd_grant))
     app.add_handler(CommandHandler("revoke", _cmd_revoke))

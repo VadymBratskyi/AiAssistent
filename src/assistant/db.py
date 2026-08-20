@@ -34,6 +34,17 @@ CREATE TABLE IF NOT EXISTS allowed_users (
     is_admin   INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    fire_at    INTEGER NOT NULL,           -- unix seconds
+    text       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    fired      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_reminders_fire_at
+    ON reminders(fired, fire_at);
 """
 
 
@@ -159,3 +170,46 @@ class Db:
         with self._conn() as c:
             (n,) = c.execute("SELECT COUNT(*) FROM allowed_users").fetchone()
         return n
+
+    # ---- reminders ------------------------------------------------------
+
+    def add_reminder(self, user_id: int, fire_at: int, text: str) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO reminders(user_id, fire_at, text, created_at) VALUES(?, ?, ?, ?)",
+                (user_id, fire_at, text.strip(), int(time.time())),
+            )
+            return cur.lastrowid
+
+    def due_reminders(self, now: int) -> list[tuple[int, int, str]]:
+        """Return (id, user_id, text) for reminders whose fire_at <= now and
+        not yet fired."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, user_id, text FROM reminders "
+                "WHERE fired=0 AND fire_at<=? ORDER BY fire_at",
+                (now,),
+            ).fetchall()
+        return [(rid, uid, txt) for rid, uid, txt in rows]
+
+    def mark_reminder_fired(self, reminder_id: int) -> None:
+        with self._conn() as c:
+            c.execute("UPDATE reminders SET fired=1 WHERE id=?", (reminder_id,))
+
+    def list_upcoming_reminders(self, user_id: int) -> list[tuple[int, int, str]]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT id, fire_at, text FROM reminders "
+                "WHERE user_id=? AND fired=0 ORDER BY fire_at",
+                (user_id,),
+            ).fetchall()
+        return [(rid, fa, txt) for rid, fa, txt in rows]
+
+    def cancel_reminder(self, reminder_id: int, user_id: int) -> bool:
+        """Delete only if owned by user_id, returns True if a row was removed."""
+        with self._conn() as c:
+            cur = c.execute(
+                "DELETE FROM reminders WHERE id=? AND user_id=? AND fired=0",
+                (reminder_id, user_id),
+            )
+            return cur.rowcount > 0

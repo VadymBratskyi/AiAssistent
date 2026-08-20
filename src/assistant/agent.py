@@ -216,6 +216,65 @@ class Agent:
                         text_parts.append(block.text)
         return "\n".join(text_parts).strip() or "(no response)"
 
+    async def parse_reminder(self, user_input: str) -> tuple[int, str] | None:
+        """Parse a Ukrainian/English `/remind` input into (fire_at_unix_seconds, text).
+
+        Returns None if unparseable or in the past. Uses a one-shot Claude
+        call so free-form phrasings like "через 15 хв", "завтра о 15",
+        "у п'ятницю о 10 ранку" all work.
+        """
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        import json
+
+        now_kyiv = datetime.now(ZoneInfo("Europe/Kyiv"))
+        prompt = (
+            "You parse a reminder request into structured JSON.\n\n"
+            f"CURRENT DATETIME (Europe/Kyiv): {now_kyiv.isoformat()}\n"
+            f"INPUT: {user_input}\n\n"
+            "Rules:\n"
+            "- The input mixes a time expression (relative like 'через 15 хв', "
+            "  '5 хвилин', absolute like 'завтра о 15:00', 'п'ятниця 10:00') "
+            "  and a reminder text.\n"
+            "- If no explicit time is given, assume 'через 1 годину'.\n"
+            "- Return one JSON object, nothing else:\n"
+            '  {"fire_at": "<ISO 8601 with +03:00 or +02:00 offset>", "text": "<the reminder text only>"}\n'
+            "- If the time cannot be interpreted at all, return exactly: NONE\n"
+        )
+        options = ClaudeAgentOptions(
+            model=self.model,
+            max_turns=1,
+            permission_mode="bypassPermissions",
+            disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
+        )
+        collected: list[str] = []
+        try:
+            async for msg in query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            collected.append(block.text)
+        except Exception:
+            log.exception("parse_reminder failed")
+            return None
+        raw = " ".join(collected).strip()
+        if not raw or raw.upper().startswith("NONE"):
+            return None
+        # Sometimes the model wraps JSON in ```json fences — strip them.
+        raw = raw.strip("`").strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].strip()
+        try:
+            data = json.loads(raw)
+            fire_at = datetime.fromisoformat(data["fire_at"])
+            text = str(data["text"]).strip()
+        except (json.JSONDecodeError, KeyError, ValueError):
+            log.warning("parse_reminder unparseable output: %r", raw[:200])
+            return None
+        if not text:
+            return None
+        return int(fire_at.timestamp()), text
+
     async def suggest_memory(self, user_message: str, reply: str) -> str | None:
         """Ask Claude in a one-shot session whether this exchange contains one
         stable, non-trivial fact worth remembering long-term. Returns the fact
