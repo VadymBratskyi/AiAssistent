@@ -195,6 +195,27 @@ class Agent:
         await self._drop_client(chat_id)
         self.db.clear_thread(chat_id)
 
+    async def one_shot(self, prompt: str) -> str:
+        """Run a stateless query (no session, no chat memory) — used for
+        proactive things like the morning brief. Memory is still prepended
+        so facts about the user are available."""
+        mem = self.memory.snapshot_for_prompt()
+        wrapped = f"{mem}\n\n---\n\n{prompt}" if mem else prompt
+        options = ClaudeAgentOptions(
+            system_prompt=self.system_prompt,
+            model=self.model,
+            max_turns=10,
+            permission_mode="bypassPermissions",
+            disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
+        )
+        text_parts: list[str] = []
+        async for msg in query(prompt=wrapped, options=options):
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock):
+                        text_parts.append(block.text)
+        return "\n".join(text_parts).strip() or "(no response)"
+
     async def suggest_memory(self, user_message: str, reply: str) -> str | None:
         """Ask Claude in a one-shot session whether this exchange contains one
         stable, non-trivial fact worth remembering long-term. Returns the fact

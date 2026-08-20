@@ -30,6 +30,7 @@ from .credmon import CredentialsMonitor
 from .db import Db
 from .host_helper import HostHelper, HostHelperError
 from .memory import Memory
+from .morning import BRIEF_PROMPT, MorningBrief
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
@@ -304,6 +305,29 @@ async def _cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_agent_instruction(update, ctx, PROMPT_WEEK)
+
+
+async def _run_brief(app: Application, prompt: str) -> str:
+    """Run the agent stateless for the morning brief."""
+    agent: Agent = app.bot_data["agent"]
+    return await agent.one_shot(prompt)
+
+
+async def _cmd_morning(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run the morning brief on demand."""
+    if not _gate(ctx, update):
+        return
+    message = update.effective_message
+    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    try:
+        reply = await _run_brief(ctx.application, BRIEF_PROMPT)
+    except Exception:
+        log.exception("morning brief failed")
+        await _react(ctx, message.chat_id, message.message_id, "🤯")
+        await message.reply_text("Не вдалось скласти бриф. Див. логи.")
+        return
+    await message.reply_text(reply)
+    await _react(ctx, message.chat_id, message.message_id, "👍")
 
 
 # ---- memory --------------------------------------------------------------
@@ -610,6 +634,15 @@ async def _post_init(app: Application) -> None:
     monitor = CredentialsMonitor(notify=lambda text: _notify_admins(app, text))
     monitor.start()
     app.bot_data["credmon"] = monitor
+
+    agent: Agent = app.bot_data["agent"]
+    brief = MorningBrief(
+        push=lambda text: _notify_admins(app, text),
+        get_agent_reply=lambda prompt: _run_brief(app, prompt),
+        get_creds_state=lambda: monitor._state or "healthy",
+    )
+    brief.start()
+    app.bot_data["morning"] = brief
     await app.bot.set_my_commands(
         [
             BotCommand("my", "Мої задачі в роботі"),
@@ -617,6 +650,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("mail", "Останні листи"),
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
+            BotCommand("morning", "Ранковий бриф зараз"),
             BotCommand("reset", "Очистити контекст розмови"),
             BotCommand("remember", "Запам'ятати факт про мене"),
             BotCommand("memory", "Показати що бот пам'ятає"),
@@ -658,6 +692,7 @@ def build_application(
     app.add_handler(CommandHandler("mail", _cmd_mail))
     app.add_handler(CommandHandler("today", _cmd_today))
     app.add_handler(CommandHandler("week", _cmd_week))
+    app.add_handler(CommandHandler("morning", _cmd_morning))
     app.add_handler(CommandHandler("users", _cmd_users))
     app.add_handler(CommandHandler("grant", _cmd_grant))
     app.add_handler(CommandHandler("revoke", _cmd_revoke))
