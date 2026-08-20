@@ -10,9 +10,11 @@ from claude_agent_sdk import (
     ClaudeSDKClient,
     ResultMessage,
     TextBlock,
+    query,
 )
 
 from .db import Db
+from .memory import Memory
 
 log = logging.getLogger(__name__)
 
@@ -24,7 +26,10 @@ Style:
 - Times for this user are Kyiv (UTC+3) unless stated otherwise.
 
 Connectors available to you via MCP:
-- Atlassian (Jira + Confluence) on creatio-misk.atlassian.net, cloudId 5989155e-2f13-4fe3-9126-df63c85122a8.
+- Atlassian (Jira + Confluence). The user's active site can change; call
+  `getAccessibleAtlassianResources` at the start of any Jira/Confluence
+  interaction to discover the current cloudId — do not assume a specific
+  site or cloudId. There is usually exactly one accessible resource; use it.
 - Microsoft 365 (Outlook mail, Teams meetings / calendar, SharePoint).
 - Playwright (headless Chromium in the container, isolated profile per session). Use it for opening URLs, scraping public pages, taking screenshots, or testing public web flows. The browser has NO logins — it cannot access anything that requires authentication.
   - When the user asks for "скріншот / screenshot / знімок / фото сторінки / зображення", you MUST call the `browser_take_screenshot` tool (which writes a PNG to disk). Do NOT substitute `browser_snapshot` (DOM-only YAML) and do NOT fabricate a filename — only mention files that the screenshot tool actually returned. The bot auto-attaches any PNGs you produced to the chat after your reply.
@@ -54,6 +59,14 @@ How to behave:
 - Empty result is a valid answer; just say "нічого не знайдено" or equivalent.
 - Read-only by default. Never send mail, post comments, create/edit tickets, or delete anything unless the user explicitly asked.
 
+Long-term memory:
+- Each user turn is preceded by a "Пам'ять про мене:" block listing facts the user has taught the bot. Treat these as authoritative context about them. Never contradict them; use them silently rather than restating unless asked.
+- If the user asks "що ти пам'ятаєш про мене" — summarize the memory block, but the /memory command is preferred (it shows the raw file).
+- You cannot write to memory directly. The user manages it via /remember and /forget commands.
+
+Creatio work:
+- The user is a Creatio developer. When a question touches Creatio platform internals, base classes, EntitySchemaQuery, business processes, or Freedom UI patterns — try the `creatio-codebase` skill (if available in your Skill tool) before guessing. The source lives on host at C:\\Projects\\core and C:\\Projects\\creatio_client, mounted read-only at /host/c/Projects/*.
+
 Out of scope:
 - Drafting PRs from Jira tickets — not implemented yet.
 """
@@ -64,8 +77,16 @@ class Agent:
     in-memory across turns without the on-disk resume that caused tool-use
     skipping."""
 
-    def __init__(self, db: Db, model: str | None = None) -> None:
+    def __init__(
+        self,
+        db: Db,
+        system_prompt: str,
+        memory: Memory,
+        model: str | None = None,
+    ) -> None:
         self.db = db
+        self.system_prompt = system_prompt
+        self.memory = memory
         self.model = model
         self._clients: dict[int, ClaudeSDKClient] = {}
         # Per-chat lock so two messages from the same chat don't race on the
@@ -74,7 +95,7 @@ class Agent:
 
     def _options(self) -> ClaudeAgentOptions:
         return ClaudeAgentOptions(
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=self.system_prompt,
             model=self.model,
             max_turns=10,
             permission_mode="bypassPermissions",
@@ -152,7 +173,9 @@ class Agent:
 
     async def _send(self, chat_id: int, user_message: str) -> str:
         client = await self._client(chat_id)
-        await client.query(user_message)
+        mem = self.memory.snapshot_for_prompt()
+        wrapped = f"{mem}\n\n---\n\n{user_message}" if mem else user_message
+        await client.query(wrapped)
 
         text_parts: list[str] = []
         usage_info = None
@@ -171,6 +194,46 @@ class Agent:
     async def clear(self, chat_id: int) -> None:
         await self._drop_client(chat_id)
         self.db.clear_thread(chat_id)
+
+    async def suggest_memory(self, user_message: str, reply: str) -> str | None:
+        """Ask Claude in a one-shot session whether this exchange contains one
+        stable, non-trivial fact worth remembering long-term. Returns the fact
+        text (short, imperative) or None. Isolated from the main conversation.
+        """
+        existing = self.memory.snapshot_for_prompt() or "(порожньо)"
+        prompt = (
+            "You extract one long-term memory candidate from a single user↔bot exchange.\n\n"
+            f"CURRENT MEMORY:\n{existing}\n\n"
+            f"USER SAID:\n{user_message}\n\n"
+            f"BOT REPLIED:\n{reply}\n\n"
+            "Rules:\n"
+            "- Only propose STABLE facts about the user (roles, preferences, tools, "
+            "  projects, patterns, deadlines). Not one-off queries or transient state.\n"
+            "- Do NOT duplicate anything already in CURRENT MEMORY.\n"
+            "- Output ONE short line in Ukrainian, or exactly 'NONE'.\n"
+        )
+        options = ClaudeAgentOptions(
+            model=self.model,
+            max_turns=1,
+            permission_mode="bypassPermissions",
+            disallowed_tools=["Bash", "Write", "Edit", "NotebookEdit", "Task"],
+        )
+        collected: list[str] = []
+        try:
+            async for msg in query(prompt=prompt, options=options):
+                if isinstance(msg, AssistantMessage):
+                    for block in msg.content:
+                        if isinstance(block, TextBlock):
+                            collected.append(block.text)
+        except Exception:
+            log.debug("suggest_memory failed", exc_info=True)
+            return None
+        candidate = " ".join(collected).strip()
+        if not candidate or candidate.upper().startswith("NONE"):
+            return None
+        # Sanity: single line, drop any bullet markers Claude may add.
+        candidate = candidate.splitlines()[0].lstrip("-•* ").strip()
+        return candidate or None
 
 
 __all__ = ["Agent", "SYSTEM_PROMPT"]

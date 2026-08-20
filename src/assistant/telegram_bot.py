@@ -1,14 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 from pathlib import Path
 
-from telegram import BotCommand, ReactionTypeEmoji, ReplyKeyboardRemove, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReactionTypeEmoji,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -19,26 +28,24 @@ from .agent import Agent
 from .config import Config
 from .credmon import CredentialsMonitor
 from .db import Db
+from .host_helper import HostHelper, HostHelperError
+from .memory import Memory
 from .stt import Transcriber
 
 log = logging.getLogger(__name__)
 
-# Known Atlassian cloud for this user (see project CLAUDE.md).
-JIRA_CLOUD_ID = "5989155e-2f13-4fe3-9126-df63c85122a8"
-
-
-# Canned instructions for the shortcut commands. Phrased as natural requests
-# so they sit cleanly in the conversation history and the agent (which has the
-# Atlassian MCP) executes them with the exact JQL — no guessing.
+# Prompt templates. Atlassian cloudId is NOT hardcoded — the agent discovers
+# it via getAccessibleAtlassianResources so switching Jira site (via
+# /mcp → re-auth with a different "Use app on") requires no bot changes.
 PROMPT_MY = (
-    "Покажи мої задачі в роботі. Використай Atlassian Jira MCP з "
-    f'cloudId {JIRA_CLOUD_ID} і JQL: assignee = currentUser() AND status = "In Progress". '
+    "Спершу виклич Atlassian getAccessibleAtlassianResources щоб дізнатись cloudId. "
+    'Потім знайди мої задачі в роботі JQL-ом: assignee = currentUser() AND status = "In Progress". '
     "Виведи стисло для Telegram: для кожної задачі — ключ, summary, статус і пряме посилання. "
     "Якщо задач немає — так і скажи одним рядком."
 )
 PROMPT_FREE = (
-    "Покажи вільні dev-задачі. Використай Atlassian Jira MCP з "
-    f'cloudId {JIRA_CLOUD_ID} і JQL: status = "Selected for Development" AND labels = Dev. '
+    "Спершу виклич Atlassian getAccessibleAtlassianResources щоб дізнатись cloudId. "
+    'Потім знайди вільні dev-задачі JQL-ом: status = "Selected for Development" AND labels = Dev. '
     "Виведи стисло для Telegram: для кожної задачі — ключ, summary, статус і пряме посилання. "
     "Якщо задач немає — так і скажи одним рядком."
 )
@@ -142,8 +149,10 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/mail — останні листи\n"
         "/today — зустрічі сьогодні\n"
         "/week — зустрічі на тиждень\n"
+        "/remember, /memory, /forget — довгострокова пам'ять\n"
         "/reset — очистити контекст розмови\n\n"
-        "Або просто пиши/говори природною мовою — Jira, пошта й календар підключені.",
+        "Пиши/говори природною мовою — Jira, пошта й календар підключені. "
+        "Після відповіді я можу запропонувати запам'ятати важливий факт про тебе.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -166,6 +175,84 @@ async def _cmd_login(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not _gate(ctx, update):
         return
     await update.effective_message.reply_text(LOGIN_HELP, parse_mode="Markdown")
+
+
+def _reauth_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔐 Re-auth зараз", callback_data="reauth")]]
+    )
+
+
+async def _trigger_reauth(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    helper: HostHelper = ctx.application.bot_data["host_helper"]
+    if not helper.available:
+        await ctx.bot.send_message(
+            chat_id,
+            "Host-helper не налаштований. Постав його один раз:\n"
+            "`powershell -ExecutionPolicy Bypass -File deploy\\install-host-helper.ps1`\n"
+            "І додай HOST_HELPER_URL / HOST_HELPER_TOKEN у .env.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        await helper.trigger_claude_login()
+    except HostHelperError as e:
+        await ctx.bot.send_message(chat_id, f"❌ {e}")
+        return
+    await ctx.bot.send_message(
+        chat_id,
+        "🚀 Запустив `claude login` на твоєму ПК. Терміналі має відкритись — пройди SSO+MFA у браузері.\n"
+        "Коли токен оновиться, я сам повідомлю.",
+    )
+
+
+async def _cmd_reauth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    await _trigger_reauth(ctx, update.effective_chat.id)
+
+
+async def _on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    try:
+        await query.answer()
+    except Exception:
+        pass
+    if not _gate(ctx, update):
+        return
+    data = query.data or ""
+    if data == "reauth":
+        await _trigger_reauth(ctx, query.message.chat_id)
+        return
+    if data.startswith("mem:"):
+        await _handle_memory_callback(ctx, query, data)
+        return
+
+
+async def _handle_memory_callback(ctx: ContextTypes.DEFAULT_TYPE, query, data: str) -> None:
+    _, decision, cid = data.split(":", 2)
+    pending: dict = ctx.application.bot_data["mem_pending"]
+    candidate = pending.pop(cid, None)
+    if candidate is None:
+        try:
+            await query.edit_message_text("⌛ Пропозиція вже застаріла.")
+        except Exception:
+            pass
+        return
+    if decision == "yes":
+        memory: Memory = ctx.application.bot_data["memory"]
+        memory.append(candidate)
+        try:
+            await query.edit_message_text(f"📌 Запам'ятав: _{candidate}_", parse_mode="Markdown")
+        except Exception:
+            pass
+    else:
+        try:
+            await query.edit_message_text(f"🚫 Не зберігаю: _{candidate}_", parse_mode="Markdown")
+        except Exception:
+            pass
 
 
 async def _cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -217,6 +304,91 @@ async def _cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_agent_instruction(update, ctx, PROMPT_WEEK)
+
+
+# ---- memory --------------------------------------------------------------
+
+async def _cmd_remember(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    memory: Memory = ctx.application.bot_data["memory"]
+    text = " ".join(ctx.args or []).strip()
+    if not text:
+        await update.effective_message.reply_text(
+            "Використання: `/remember <факт для довгострокової пам'яті>`",
+            parse_mode="Markdown",
+        )
+        return
+    line = memory.append(text)
+    await update.effective_message.reply_text(f"📌 Запам'ятав:\n{line}")
+
+
+async def _cmd_forget(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    memory: Memory = ctx.application.bot_data["memory"]
+    needle = " ".join(ctx.args or []).strip()
+    if not needle:
+        await update.effective_message.reply_text(
+            "Використання: `/forget <підрядок для видалення>`", parse_mode="Markdown"
+        )
+        return
+    n = memory.remove_matching(needle)
+    if n == 0:
+        await update.effective_message.reply_text(f"Нічого не знайшов з підрядком `{needle}`.", parse_mode="Markdown")
+    else:
+        await update.effective_message.reply_text(f"🗑 Видалив {n} запис(ів).")
+
+
+async def _cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    memory: Memory = ctx.application.bot_data["memory"]
+    facts = memory.facts()
+    if not facts:
+        await update.effective_message.reply_text("Пам'ять порожня. Додай факт через `/remember ...`", parse_mode="Markdown")
+        return
+    body = "\n".join(f"• {f}" for f in facts)
+    await update.effective_message.reply_text(f"🧠 Пам'ять ({len(facts)} факт(ів)):\n\n{body}")
+
+
+def _mem_prompt_keyboard(candidate_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("📌 Запам'ятати", callback_data=f"mem:yes:{candidate_id}"),
+            InlineKeyboardButton("🚫 Ні", callback_data=f"mem:no:{candidate_id}"),
+        ]]
+    )
+
+
+async def _maybe_offer_memory(
+    ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_message: str, reply: str
+) -> None:
+    """Async post-reply hook: ask Claude for a memory candidate; if one is
+    found, send an inline button so the user can accept it."""
+    agent: Agent = ctx.application.bot_data["agent"]
+    try:
+        candidate = await agent.suggest_memory(user_message, reply)
+    except Exception:
+        log.exception("suggest_memory failed")
+        return
+    if not candidate:
+        return
+    # Stash by a short random id so the callback data stays under Telegram's
+    # 64-byte limit. Cache is process-memory only; benign if lost on restart.
+    pending: dict = ctx.application.bot_data["mem_pending"]
+    cid = f"{int(asyncio.get_running_loop().time() * 1000) % 10_000_000}"
+    pending[cid] = candidate
+    try:
+        await ctx.bot.send_message(
+            chat_id,
+            f"💡 Помітив, що можна запам'ятати:\n\n_{candidate}_\n\nЗберегти?",
+            parse_mode="Markdown",
+            reply_markup=_mem_prompt_keyboard(cid),
+        )
+    except Exception:
+        log.exception("failed to send memory offer")
+        pending.pop(cid, None)
 
 
 # ---- admin: user management ------------------------------------------------
@@ -297,6 +469,9 @@ async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(reply)
     await _flush_screenshots(ctx, message.chat_id)
     await _react(ctx, message.chat_id, message.message_id, "👍")
+    ctx.application.create_task(
+        _maybe_offer_memory(ctx, message.chat_id, message.text, reply)
+    )
 
 
 async def _on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -342,6 +517,9 @@ async def _on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(reply)
     await _flush_screenshots(ctx, message.chat_id)
     await _react(ctx, message.chat_id, message.message_id, "👍")
+    ctx.application.create_task(
+        _maybe_offer_memory(ctx, message.chat_id, caption, reply)
+    )
 
 
 async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -402,21 +580,33 @@ async def _on_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(reply)
     await _flush_screenshots(ctx, message.chat_id)
     await _react(ctx, message.chat_id, message.message_id, "👍")
+    ctx.application.create_task(
+        _maybe_offer_memory(ctx, message.chat_id, transcript, reply)
+    )
 
 
 async def _notify_admins(app: Application, text: str) -> None:
-    """Push a message to every admin user in the allowlist."""
+    """Push a message to every admin user in the allowlist.
+
+    Attaches an inline 🔐 Re-auth button on messages that mention expired
+    credentials so the user can trigger recovery with one tap.
+    """
     db: Db = app.bot_data["db"]
+    helper: HostHelper = app.bot_data["host_helper"]
+    keyboard = None
+    if helper.available and ("протермін" in text.lower() or "expired" in text.lower() or "зник" in text.lower()):
+        keyboard = _reauth_keyboard()
     for user_id, _username, is_admin, _ in db.list_users():
         if not is_admin:
             continue
         try:
-            await app.bot.send_message(chat_id=user_id, text=text)
+            await app.bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard)
         except Exception:
             log.exception("failed to push admin notification to %s", user_id)
 
 
 async def _post_init(app: Application) -> None:
+    app.bot_data["host_helper"] = HostHelper()
     monitor = CredentialsMonitor(notify=lambda text: _notify_admins(app, text))
     monitor.start()
     app.bot_data["credmon"] = monitor
@@ -428,7 +618,11 @@ async def _post_init(app: Application) -> None:
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
             BotCommand("reset", "Очистити контекст розмови"),
+            BotCommand("remember", "Запам'ятати факт про мене"),
+            BotCommand("memory", "Показати що бот пам'ятає"),
+            BotCommand("forget", "Забути факт за підрядком"),
             BotCommand("login", "Інструкція як оновити Claude auth"),
+            BotCommand("reauth", "Запустити claude login на хості"),
             BotCommand("users", "(admin) Список користувачів"),
             BotCommand("grant", "(admin) Додати користувача"),
             BotCommand("revoke", "(admin) Видалити користувача"),
@@ -440,16 +634,25 @@ def build_application(
     config: Config,
     agent: Agent,
     db: Db,
+    memory: Memory,
     transcriber: Transcriber | None = None,
 ) -> Application:
     app = ApplicationBuilder().token(config.telegram_bot_token).post_init(_post_init).build()
     app.bot_data["config"] = config
     app.bot_data["agent"] = agent
     app.bot_data["db"] = db
+    app.bot_data["memory"] = memory
     app.bot_data["transcriber"] = transcriber
+    # Ephemeral store: message_id → proposed memory candidate awaiting user y/n.
+    app.bot_data["mem_pending"] = {}
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("login", _cmd_login))
+    app.add_handler(CommandHandler("reauth", _cmd_reauth))
+    app.add_handler(CommandHandler("remember", _cmd_remember))
+    app.add_handler(CommandHandler("memory", _cmd_memory))
+    app.add_handler(CommandHandler("forget", _cmd_forget))
+    app.add_handler(CallbackQueryHandler(_on_callback))
     app.add_handler(CommandHandler("my", _cmd_my))
     app.add_handler(CommandHandler("free", _cmd_free))
     app.add_handler(CommandHandler("mail", _cmd_mail))

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 
-from .agent import Agent
+from .agent import Agent, SYSTEM_PROMPT
 from .config import load_config
 from .db import Db
+from .memory import Memory
 from .sslfix import sanitize_ca_env
 from .stt import Transcriber
 from .telegram_bot import build_application
@@ -38,7 +39,13 @@ def main() -> None:
                 "Send /start to discover your user_id, then add it manually via SQL "
                 "or restart with TELEGRAM_ALLOWED_CHAT_IDS set."
             )
-    agent = Agent(db=db, model=config.anthropic_model)
+    memory = Memory()
+    agent = Agent(
+        db=db,
+        system_prompt=SYSTEM_PROMPT,
+        memory=memory,
+        model=config.anthropic_model,
+    )
 
     transcriber = None
     try:
@@ -53,7 +60,7 @@ def main() -> None:
             "Bot will continue serving text."
         )
 
-    app = build_application(config, agent, db, transcriber=transcriber)
+    app = build_application(config, agent, db, memory, transcriber=transcriber)
 
     log.info(
         "assistant starting; db=%s model=%s whisper=%s lang=%s",
@@ -62,7 +69,9 @@ def main() -> None:
         config.whisper_model_size,
         config.whisper_language or "auto",
     )
-    app.run_polling(allowed_updates=["message"])
+    # `callback_query` is required for inline buttons (memory suggestions,
+    # /reauth). Without it Telegram just doesn't send those updates.
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
