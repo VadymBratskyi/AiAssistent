@@ -67,6 +67,29 @@ PROMPT_WEEK = (
     "Скасовані не показуй. Стисло для Telegram."
 )
 
+_PROMPT_TEAMS_DEFAULT = (
+    "Виклич Microsoft 365 MCP (chat_message_search) і покажи основне з моїх Teams-чатів "
+    "за останні 24 години. Згрупуй за чатом/співрозмовником, для кожного 1-2 речення суті "
+    "і, якщо є, action items що стосуються мене. Стисло для Telegram, без зайвого."
+)
+_PROMPT_TEAMS_QUERY = (
+    "Знайди в моїх Teams-чатах все що стосується: «{query}».\n\n"
+    "Стратегія пошуку — виконай ВСІ кроки й ОБ'ЄДНАЙ результати з усіх успішних, "
+    "не зупиняйся на першому непорожньому:\n"
+    "1. `chat_message_search` з запитом «{query}» як є.\n"
+    "2. Якщо в запиті є ключ типу PROJ-123 — додатково пошукай: у лапках, "
+    "тільки числова частина (123), тільки префікс (PROJ), а також повний URL "
+    "виду `atlassian.net/browse/PROJ-123` (люди часто вставляють Jira-посилання "
+    "в чат, а не текст ключа).\n"
+    "3. Якщо в Teams мало / порожньо — виклич `outlook_email_search` з тим же "
+    "запитом (Jira-нотифікації часто живуть у пошті, не у чатах).\n\n"
+    "У видачі об'єднай unique-повідомлення (уникай дублів). Формат: джерело "
+    "(Teams/Email), хто, коли, суть у 1-2 реченнях, дії які я маю зробити. "
+    "Якщо повідомлення містить лише посилання без коментаря — так і скажи. "
+    "Наприкінці, якщо результатів мало, зауваж що Microsoft Search має "
+    "затримку індексації (свіжі повідомлення можуть з'явитись за 5-30 хв)."
+)
+
 
 SCREENSHOTS_DIR = Path("/tmp/assistant-screenshots")
 INBOX_DIR = Path("/tmp/assistant-inbox")
@@ -306,6 +329,15 @@ async def _cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _cmd_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_agent_instruction(update, ctx, PROMPT_WEEK)
+
+
+async def _cmd_teams(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query_text = " ".join(ctx.args or []).strip()
+    if query_text:
+        prompt = _PROMPT_TEAMS_QUERY.format(query=query_text)
+    else:
+        prompt = _PROMPT_TEAMS_DEFAULT
+    await _run_agent_instruction(update, ctx, prompt)
 
 
 async def _run_brief(app: Application, prompt: str) -> str:
@@ -734,6 +766,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("mail", "Останні листи"),
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
+            BotCommand("teams", "Підсумок Teams-чатів (arg: нік/тема)"),
             BotCommand("morning", "Ранковий бриф зараз"),
             BotCommand("remind", "Створити нагадування"),
             BotCommand("reminders", "Активні нагадування"),
@@ -779,6 +812,7 @@ def build_application(
     app.add_handler(CommandHandler("mail", _cmd_mail))
     app.add_handler(CommandHandler("today", _cmd_today))
     app.add_handler(CommandHandler("week", _cmd_week))
+    app.add_handler(CommandHandler("teams", _cmd_teams))
     app.add_handler(CommandHandler("morning", _cmd_morning))
     app.add_handler(CommandHandler("remind", _cmd_remind))
     app.add_handler(CommandHandler("reminders", _cmd_reminders))
