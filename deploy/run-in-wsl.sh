@@ -31,6 +31,7 @@ docker run --rm --user 0:0 -v assistant-data:/data "$IMAGE" \
 docker run -d \
     --name "$NAME" \
     --restart=unless-stopped \
+    --add-host host.docker.internal:host-gateway \
     --env-file "$ENV_FILE" \
     -e HOME=/home/assistant \
     -e ASSISTANT_DB_PATH=/data/assistant.sqlite \

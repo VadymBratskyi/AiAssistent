@@ -56,16 +56,19 @@ class CredentialsMonitor:
                 pass
             self._task = None
 
+    # Threshold for "clearly invalidated": Y2K in ms. Anything below this
+    # was set by a failed refresh (usually 0 or a very small integer), which
+    # is the actual "broken, needs /login" state. A legitimately-close
+    # expiresAt just means the CLI is about to refresh — not our problem.
+    _INVALIDATED_BEFORE_MS = 946_684_800_000  # 2000-01-01 UTC
+
     def _classify(self) -> str:
         if not self.path.exists():
             return "missing"
         exp = read_expires_at(self.path)
-        if exp is None or exp <= 0:
+        if exp is None or exp < self._INVALIDATED_BEFORE_MS:
             return "expired"
-        now_ms = int(time.time() * 1000)
-        # Alert 2 min before the access token actually expires so the user has
-        # a heads-up before the next /mail or /my starts failing.
-        return "healthy" if exp > now_ms + 120_000 else "expired"
+        return "healthy"
 
     async def _loop(self) -> None:
         log.info("credmon started, path=%s interval=%ds", self.path, self.interval)
