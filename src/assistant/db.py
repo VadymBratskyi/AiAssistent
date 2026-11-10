@@ -58,6 +58,17 @@ CREATE TABLE IF NOT EXISTS team_questions (
 );
 CREATE INDEX IF NOT EXISTS idx_team_questions_msg
     ON team_questions(chat_id, message_id);
+
+CREATE TABLE IF NOT EXISTS team_inbox (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    team_id      TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    from_user_id INTEGER,
+    created_at   INTEGER NOT NULL,
+    delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_team_inbox_pending
+    ON team_inbox(team_id, delivered_at);
 """
 
 
@@ -266,6 +277,40 @@ class Db:
             return None
         keys = ["id", "team_id", "chat_id", "message_id", "text", "answer", "created_at", "answered_at"]
         return dict(zip(keys, row))
+
+    def enqueue_team_inbox(self, team_id: str, text: str, from_user_id: int | None) -> int:
+        with self._conn() as c:
+            cur = c.execute(
+                "INSERT INTO team_inbox(team_id, text, from_user_id, created_at) VALUES(?,?,?,?)",
+                (team_id, text, from_user_id, int(time.time())),
+            )
+            return cur.lastrowid
+
+    def fetch_team_inbox(self, team_id: str, limit: int = 20) -> list[dict]:
+        """Атомарно забрати всі недоставлені повідомлення команди і маркувати їх."""
+        now = int(time.time())
+        with self._conn() as c:
+            c.execute("BEGIN IMMEDIATE")
+            rows = c.execute(
+                "SELECT id, text, from_user_id, created_at FROM team_inbox "
+                "WHERE team_id=? AND delivered_at IS NULL "
+                "ORDER BY id LIMIT ?",
+                (team_id, limit),
+            ).fetchall()
+            if not rows:
+                c.execute("COMMIT")
+                return []
+            ids = [r[0] for r in rows]
+            placeholders = ",".join("?" * len(ids))
+            c.execute(
+                f"UPDATE team_inbox SET delivered_at=? WHERE id IN ({placeholders})",
+                [now, *ids],
+            )
+            c.execute("COMMIT")
+        return [
+            {"id": rid, "text": txt, "from_user_id": uid, "created_at": ts}
+            for rid, txt, uid, ts in rows
+        ]
 
     def find_team_question_by_message(self, chat_id: int, message_id: int) -> str | None:
         with self._conn() as c:

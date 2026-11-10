@@ -27,6 +27,8 @@ log = logging.getLogger(__name__)
 # Live-only: втрачається при рестарті, тож /answer після рестарту віддасть
 # відповідь з БД (якщо вона є) або 404.
 _WAITERS: dict[str, asyncio.Event] = {}
+# team_id → Event, яка ставиться коли в inbox цієї команди з'являється повідомлення.
+_INBOX_WAITERS: dict[str, asyncio.Event] = {}
 
 LONG_POLL_TIMEOUT = 25.0
 
@@ -36,6 +38,14 @@ def notify_question_answered(qid: str) -> None:
     ev = _WAITERS.get(qid)
     if ev is not None:
         ev.set()
+
+
+def notify_inbox(team_id: str) -> None:
+    """Викликається коли бот поклав нове повідомлення в чергу команди."""
+    ev = _INBOX_WAITERS.get(team_id)
+    if ev is not None:
+        ev.set()
+        ev.clear()
 
 
 SendNotifyFn = Callable[[int, str, str | None], Awaitable[int]]
@@ -153,9 +163,27 @@ def build_app(
             {"question_id": qid, "answer": row["answer"], "answered_at": row["answered_at"]}
         )
 
+    async def inbox(request: web.Request) -> web.Response:
+        team_id = request.match_info["team"]
+        if team_id not in config.teams:
+            return web.json_response({"error": f"unknown team: {team_id}"}, status=404)
+        msgs = db.fetch_team_inbox(team_id)
+        if msgs:
+            return web.json_response({"messages": msgs})
+        ev = _INBOX_WAITERS.setdefault(team_id, asyncio.Event())
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=LONG_POLL_TIMEOUT)
+        except asyncio.TimeoutError:
+            return web.Response(status=204)
+        msgs = db.fetch_team_inbox(team_id)
+        if not msgs:
+            return web.Response(status=204)
+        return web.json_response({"messages": msgs})
+
     app.router.add_post("/teams/{team}/notify", notify)
     app.router.add_post("/teams/{team}/ask", ask)
     app.router.add_get("/teams/{team}/answer/{qid}", answer)
+    app.router.add_get("/teams/{team}/inbox", inbox)
     app.router.add_get("/health", lambda r: web.json_response({"ok": True}))
     return app
 

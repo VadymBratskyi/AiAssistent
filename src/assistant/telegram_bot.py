@@ -515,6 +515,17 @@ async def _cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if tc is None:
         await message.reply_text(f"Команда `{tid}` не знайдена.", parse_mode="Markdown")
         return
+    # /team <id> <text...> — покласти повідомлення в чергу цієї команди.
+    if len(args) > 1:
+        text = " ".join(args[1:]).strip()
+        db: Db = ctx.application.bot_data["db"]
+        mid = db.enqueue_team_inbox(tid, text, update.effective_user.id if update.effective_user else None)
+        teams_api.notify_inbox(tid)
+        await message.reply_text(
+            f"📨 [{tid}] повідомлення #{mid} у черзі. "
+            f"Оркестратор забере його при наступному pull."
+        )
+        return
     chat_hint = str(tc.notify_chat_id) if tc.notify_chat_id else "(fallback: перший адмін)"
     lines = [
         f"🏷 *{tid}*",
@@ -527,7 +538,8 @@ async def _cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     port = config.orchestrator_port
     host = config.orchestrator_host
     lines.append("")
-    lines.append(f"API: `http://{host}:{port}/teams/{tid}/notify|ask|answer/<id>`")
+    lines.append(f"API: `http://{host}:{port}/teams/{tid}/{{notify,ask,answer/<id>,inbox}}`")
+    lines.append(f"Надіслати оркестратору: `/team {tid} <повідомлення>`")
     await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
