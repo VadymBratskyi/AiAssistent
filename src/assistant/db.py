@@ -45,6 +45,19 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_fire_at
     ON reminders(fired, fire_at);
+
+CREATE TABLE IF NOT EXISTS team_questions (
+    id          TEXT PRIMARY KEY,           -- uuid4 hex, referenced by orchestrator
+    team_id     TEXT NOT NULL,
+    chat_id     INTEGER NOT NULL,           -- куди надіслано питання
+    message_id  INTEGER,                    -- id повідомлення-питання в Telegram
+    text        TEXT NOT NULL,
+    answer      TEXT,
+    created_at  INTEGER NOT NULL,
+    answered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_team_questions_msg
+    ON team_questions(chat_id, message_id);
 """
 
 
@@ -213,3 +226,51 @@ class Db:
                 (reminder_id, user_id),
             )
             return cur.rowcount > 0
+
+    # ---- team orchestrator questions ------------------------------------
+
+    def add_team_question(
+        self, qid: str, team_id: str, chat_id: int, message_id: int | None, text: str
+    ) -> None:
+        with self._conn() as c:
+            c.execute(
+                "INSERT INTO team_questions(id, team_id, chat_id, message_id, text, created_at) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (qid, team_id, chat_id, message_id, text, int(time.time())),
+            )
+
+    def set_team_question_message_id(self, qid: str, message_id: int) -> None:
+        with self._conn() as c:
+            c.execute(
+                "UPDATE team_questions SET message_id=? WHERE id=?", (message_id, qid)
+            )
+
+    def answer_team_question(self, qid: str, answer: str) -> bool:
+        """Set answer if not already answered. Returns True if this call set it."""
+        with self._conn() as c:
+            cur = c.execute(
+                "UPDATE team_questions SET answer=?, answered_at=? "
+                "WHERE id=? AND answer IS NULL",
+                (answer, int(time.time()), qid),
+            )
+            return cur.rowcount > 0
+
+    def get_team_question(self, qid: str) -> dict | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id, team_id, chat_id, message_id, text, answer, created_at, answered_at "
+                "FROM team_questions WHERE id=?",
+                (qid,),
+            ).fetchone()
+        if not row:
+            return None
+        keys = ["id", "team_id", "chat_id", "message_id", "text", "answer", "created_at", "answered_at"]
+        return dict(zip(keys, row))
+
+    def find_team_question_by_message(self, chat_id: int, message_id: int) -> str | None:
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT id FROM team_questions WHERE chat_id=? AND message_id=? AND answer IS NULL",
+                (chat_id, message_id),
+            ).fetchone()
+        return row[0] if row else None

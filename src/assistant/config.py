@@ -6,6 +6,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .teams import TeamConfig, load_teams
+
 
 @dataclass(frozen=True)
 class Config:
@@ -17,6 +19,11 @@ class Config:
     whisper_model_size: str
     whisper_language: str | None
     whisper_cache_dir: Path | None
+    auto_pull_repos: tuple[str, ...]
+    teams: dict[str, TeamConfig]
+    orchestrator_token: str | None
+    orchestrator_host: str
+    orchestrator_port: int
 
     def is_chat_allowed(self, chat_id: int) -> bool:
         # Empty allowlist = bootstrap mode: log chat_id so the user can add it,
@@ -50,6 +57,13 @@ def load_config() -> Config:
     model = os.environ.get("ANTHROPIC_MODEL", "").strip() or None
     whisper_lang = os.environ.get("WHISPER_LANGUAGE", "").strip() or None
     whisper_cache_raw = os.environ.get("WHISPER_CACHE_DIR", "").strip()
+    auto_pull_raw = os.environ.get("AUTO_PULL_REPOS", "creatio-ui,creatio-core").strip()
+    auto_pull = tuple(r.strip() for r in auto_pull_raw.split(",") if r.strip())
+    teams_path = Path(os.environ.get("TEAMS_CONFIG_PATH", "./teams.yaml"))
+    teams = load_teams(teams_path)
+    orchestrator_token = os.environ.get("ORCHESTRATOR_TOKEN", "").strip() or None
+    orchestrator_host = os.environ.get("ORCHESTRATOR_API_HOST", "127.0.0.1").strip()
+    orchestrator_port = int(os.environ.get("ORCHESTRATOR_API_PORT", "47824"))
     return Config(
         telegram_bot_token=_require("TELEGRAM_BOT_TOKEN"),
         telegram_allowed_chat_ids=_parse_chat_ids(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")),
@@ -59,4 +73,9 @@ def load_config() -> Config:
         whisper_model_size=os.environ.get("WHISPER_MODEL_SIZE", "small"),
         whisper_language=whisper_lang,
         whisper_cache_dir=Path(whisper_cache_raw) if whisper_cache_raw else None,
+        auto_pull_repos=auto_pull,
+        teams=teams,
+        orchestrator_token=orchestrator_token,
+        orchestrator_host=orchestrator_host,
+        orchestrator_port=orchestrator_port,
     )

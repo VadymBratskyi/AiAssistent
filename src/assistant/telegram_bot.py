@@ -29,10 +29,12 @@ from .config import Config
 from .credmon import CredentialsMonitor
 from .db import Db
 from .host_helper import HostHelper, HostHelperError
+from .gitpull import GitPullScheduler, pull_all
 from .memory import Memory
 from .morning import BRIEF_PROMPT, MorningBrief
 from .reminders import RemindersScheduler
 from .stt import Transcriber
+from . import teams_api
 
 log = logging.getLogger(__name__)
 
@@ -225,6 +227,10 @@ HELP_BODY = (
     "🔐 *Авторизація Claude*\n"
     "/login — інструкція як оновити токен вручну\n"
     "/reauth — запустити `claude login` на хості (потрібен host-helper)\n\n"
+    "🌱 *Git*\n"
+    "/pull `[repo...]` — оновити репозиторії; без аргументів — усі дозволені\n"
+    "/repos — список дозволених репо\n"
+    "_(автоматично о 08:00 буднями для AUTO_PULL_REPOS з .env)_\n\n"
     "🔧 *Інше*\n"
     "/reset — очистити контекст поточної розмови\n"
     "/start — привітання і швидке меню\n"
@@ -287,6 +293,61 @@ async def _cmd_reauth(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _trigger_reauth(ctx, update.effective_chat.id)
 
 
+async def _cmd_repos(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    helper: HostHelper = ctx.application.bot_data["host_helper"]
+    if not helper.available:
+        await update.effective_message.reply_text(
+            "Host-helper не налаштований. Встанови: "
+            "`powershell -ExecutionPolicy Bypass -File deploy\\install-host-helper.ps1`",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        repos = await helper.list_repos()
+    except HostHelperError as e:
+        await update.effective_message.reply_text(f"❌ {e}")
+        return
+    if not repos:
+        await update.effective_message.reply_text(
+            "Список репо порожній. Додай у `~/.assistant-helper-repos.json` на хості.",
+            parse_mode="Markdown",
+        )
+        return
+    body = "📚 *Дозволені репо*:\n" + "\n".join(f"• `{r}`" for r in repos)
+    await update.effective_message.reply_text(body, parse_mode="Markdown")
+
+
+async def _cmd_pull(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _gate(ctx, update):
+        return
+    helper: HostHelper = ctx.application.bot_data["host_helper"]
+    if not helper.available:
+        await update.effective_message.reply_text(
+            "Host-helper не налаштований. Встанови: "
+            "`powershell -ExecutionPolicy Bypass -File deploy\\install-host-helper.ps1`",
+            parse_mode="Markdown",
+        )
+        return
+    args = ctx.args or []
+    # Discover repos to pull: explicit args, or the AUTO_PULL_REPOS default.
+    if args:
+        repos = args
+    else:
+        try:
+            repos = await helper.list_repos()
+        except HostHelperError as e:
+            await update.effective_message.reply_text(f"❌ {e}")
+            return
+    message = update.effective_message
+    await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+    lines = await pull_all(helper, repos)
+    await message.reply_text(
+        "🌱 *Git pull*\n\n" + "\n".join(lines), parse_mode="Markdown"
+    )
+
+
 async def _on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -304,6 +365,42 @@ async def _on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if data.startswith("mem:"):
         await _handle_memory_callback(ctx, query, data)
         return
+    if data.startswith("tq:"):
+        await _handle_team_question_callback(ctx, query, data)
+        return
+
+
+async def _handle_team_question_callback(
+    ctx: ContextTypes.DEFAULT_TYPE, query, data: str
+) -> None:
+    # data = "tq:<qid>:<opt_idx>"
+    try:
+        _, qid, idx_s = data.split(":", 2)
+        idx = int(idx_s)
+    except ValueError:
+        return
+    db: Db = ctx.application.bot_data["db"]
+    row = db.get_team_question(qid)
+    if row is None:
+        try:
+            await query.edit_message_text("⌛ Питання вже недійсне.")
+        except Exception:
+            pass
+        return
+    options: list[str] = ctx.application.bot_data["team_q_options"].get(qid, [])
+    if 0 <= idx < len(options):
+        answer = options[idx]
+    else:
+        answer = str(idx)
+    if db.answer_team_question(qid, answer):
+        teams_api.notify_question_answered(qid)
+    ctx.application.bot_data["team_q_options"].pop(qid, None)
+    try:
+        await query.edit_message_text(
+            f"[{row['team_id']}] ❓ {row['text']}\n\n✅ {answer}"
+        )
+    except Exception:
+        pass
 
 
 async def _handle_memory_callback(ctx: ContextTypes.DEFAULT_TYPE, query, data: str) -> None:
@@ -388,6 +485,50 @@ async def _cmd_teams(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         prompt = _PROMPT_TEAMS_DEFAULT
     await _run_agent_instruction(update, ctx, prompt)
+
+
+async def _cmd_team(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/team` — список команд. `/team <id>` — деталі конкретної команди."""
+    if not _gate(ctx, update):
+        return
+    config: Config = ctx.application.bot_data["config"]
+    message = update.effective_message
+    teams = config.teams
+    args = (ctx.args or [])
+    if not args:
+        if not teams:
+            await message.reply_text(
+                "Жодна команда не налаштована. Створи teams.yaml поряд з .env "
+                "(шаблон teams.yaml.example) і перезапусти бота."
+            )
+            return
+        lines = ["📋 *Налаштовані команди:*"]
+        for tid, tc in teams.items():
+            proj = tc.project or "—"
+            lines.append(f"• `{tid}` — проєкт {proj}")
+        lines.append("")
+        lines.append("Деталі: `/team <id>`")
+        await message.reply_text("\n".join(lines), parse_mode="Markdown")
+        return
+    tid = args[0]
+    tc = teams.get(tid)
+    if tc is None:
+        await message.reply_text(f"Команда `{tid}` не знайдена.", parse_mode="Markdown")
+        return
+    chat_hint = str(tc.notify_chat_id) if tc.notify_chat_id else "(fallback: перший адмін)"
+    lines = [
+        f"🏷 *{tid}*",
+        f"• project: `{tc.project or '—'}`",
+        f"• jira key: `{tc.jira_project_key or '—'}`",
+        f"• notify chat: `{chat_hint}`",
+    ]
+    if tc.description:
+        lines.append(f"• опис: {tc.description}")
+    port = config.orchestrator_port
+    host = config.orchestrator_host
+    lines.append("")
+    lines.append(f"API: `http://{host}:{port}/teams/{tid}/notify|ask|answer/<id>`")
+    await message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def _run_brief(app: Application, prompt: str) -> str:
@@ -638,6 +779,19 @@ async def _on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if message is None or not message.text:
         return
 
+    # Якщо це reply на питання оркестратора — відповідь летить йому, а не агенту.
+    if message.reply_to_message is not None:
+        db: Db = ctx.application.bot_data["db"]
+        qid = db.find_team_question_by_message(
+            message.chat_id, message.reply_to_message.message_id
+        )
+        if qid and db.answer_team_question(qid, message.text.strip()):
+            teams_api.notify_question_answered(qid)
+            ctx.application.bot_data["team_q_options"].pop(qid, None)
+            await _react(ctx, message.chat_id, message.message_id, "👍")
+            await message.reply_text("✉️ Відповідь передана оркестратору.")
+            return
+
     await ctx.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     try:
         reply = await agent.reply(message.chat_id, message.text)
@@ -809,6 +963,62 @@ async def _post_init(app: Application) -> None:
     reminders = RemindersScheduler(db=app.bot_data["db"], push=_push_reminder)
     reminders.start()
     app.bot_data["reminders"] = reminders
+
+    config: Config = app.bot_data["config"]
+    gitpull = GitPullScheduler(
+        helper=app.bot_data["host_helper"],
+        repos=list(config.auto_pull_repos),
+        push=lambda text: _notify_admins(app, text),
+    )
+    gitpull.start()
+    app.bot_data["gitpull"] = gitpull
+
+    # Team-orchestrator API server. Піднімаємо лише якщо є хоча б одна команда
+    # в teams.yaml. Без токена сервер працює, але пускає всіх — лог попередить.
+    if config.teams:
+        if not config.orchestrator_token:
+            log.warning(
+                "ORCHESTRATOR_TOKEN is empty — the local team API will accept "
+                "unauthenticated requests on %s:%d",
+                config.orchestrator_host,
+                config.orchestrator_port,
+            )
+
+        async def _send_notify(chat_id: int, text: str, parse_mode: str | None) -> int:
+            msg = await app.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=parse_mode
+            )
+            return msg.message_id
+
+        async def _send_question(
+            chat_id: int, text: str, options: list[str] | None, qid: str
+        ) -> int:
+            keyboard = None
+            if options:
+                rows = [
+                    [InlineKeyboardButton(opt, callback_data=f"tq:{qid}:{i}")]
+                    for i, opt in enumerate(options)
+                ]
+                keyboard = InlineKeyboardMarkup(rows)
+                app.bot_data["team_q_options"][qid] = list(options)
+            else:
+                text = text + "\n\n_Відповідай reply'єм на це повідомлення._"
+            msg = await app.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown" if not options else None,
+            )
+            return msg.message_id
+
+        try:
+            runner = await teams_api.start_server(
+                config, app.bot_data["db"], _send_notify, _send_question
+            )
+            app.bot_data["teams_api_runner"] = runner
+        except Exception:
+            log.exception("failed to start team orchestrator API")
+
     await app.bot.set_my_commands(
         [
             BotCommand("help", "Довідка про бота і команди"),
@@ -818,6 +1028,7 @@ async def _post_init(app: Application) -> None:
             BotCommand("today", "Зустрічі сьогодні"),
             BotCommand("week", "Зустрічі на тиждень"),
             BotCommand("teams", "Підсумок Teams-чатів (arg: нік/тема)"),
+            BotCommand("team", "Проєктні команди (sib-team тощо)"),
             BotCommand("morning", "Ранковий бриф зараз"),
             BotCommand("remind", "Створити нагадування"),
             BotCommand("reminders", "Активні нагадування"),
@@ -828,6 +1039,8 @@ async def _post_init(app: Application) -> None:
             BotCommand("forget", "Забути факт за підрядком"),
             BotCommand("login", "Інструкція як оновити Claude auth"),
             BotCommand("reauth", "Запустити claude login на хості"),
+            BotCommand("pull", "git pull для дозволених репо"),
+            BotCommand("repos", "Список дозволених репо"),
             BotCommand("users", "(admin) Список користувачів"),
             BotCommand("grant", "(admin) Додати користувача"),
             BotCommand("revoke", "(admin) Видалити користувача"),
@@ -850,11 +1063,15 @@ def build_application(
     app.bot_data["transcriber"] = transcriber
     # Ephemeral store: message_id → proposed memory candidate awaiting user y/n.
     app.bot_data["mem_pending"] = {}
+    # Ephemeral: question_id → list of answer labels (for inline-button answers).
+    app.bot_data["team_q_options"] = {}
     app.add_handler(CommandHandler("start", _cmd_start))
     app.add_handler(CommandHandler("help", _cmd_help))
     app.add_handler(CommandHandler("reset", _cmd_reset))
     app.add_handler(CommandHandler("login", _cmd_login))
     app.add_handler(CommandHandler("reauth", _cmd_reauth))
+    app.add_handler(CommandHandler("pull", _cmd_pull))
+    app.add_handler(CommandHandler("repos", _cmd_repos))
     app.add_handler(CommandHandler("remember", _cmd_remember))
     app.add_handler(CommandHandler("memory", _cmd_memory))
     app.add_handler(CommandHandler("forget", _cmd_forget))
@@ -865,6 +1082,7 @@ def build_application(
     app.add_handler(CommandHandler("today", _cmd_today))
     app.add_handler(CommandHandler("week", _cmd_week))
     app.add_handler(CommandHandler("teams", _cmd_teams))
+    app.add_handler(CommandHandler("team", _cmd_team))
     app.add_handler(CommandHandler("morning", _cmd_morning))
     app.add_handler(CommandHandler("remind", _cmd_remind))
     app.add_handler(CommandHandler("reminders", _cmd_reminders))

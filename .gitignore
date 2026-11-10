@@ -6,6 +6,8 @@ venv/
 .env
 .env.*
 !.env.example
+teams.yaml
+!teams.yaml.example
 *.sqlite
 *.sqlite3
 *.db
